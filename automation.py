@@ -1,4 +1,4 @@
-"""Windows input automation helpers for the Merlis PM bot."""
+"""Windows automation helpers for Merlis PM workflow."""
 from __future__ import annotations
 
 import time
@@ -6,9 +6,9 @@ from contextlib import contextmanager
 from typing import Iterable
 
 import win32api
+import win32clipboard
 import win32con
 import win32gui
-import win32clipboard
 
 
 def bring_window_to_front(hwnd: int | None) -> None:
@@ -50,7 +50,6 @@ def paste_text_via_clipboard(text: str) -> None:
         return
     with _clipboard_guard():
         win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
-    # CTRL+V paste
     key_down(win32con.VK_CONTROL)
     key_press(win32con.VK_V)
     key_up(win32con.VK_CONTROL)

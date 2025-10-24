@@ -1,22 +1,17 @@
-# Merlis Metin2 PM OCR Botu
+# Merlis Metin2 PM Kontrol Merkezi
 
-Windows üzerinde çalışan bu proje, Merlis oyun penceresini DXCam ile 60 FPS'e kadar yakalayarak Tesseract OCR ile özel mesaj (PM)
-panelindeki yeni mesajları tespit eder. PyQt5 ile hazırlanmış koyu temalı kontrol paneli üzerinden tüm ayarları yönetebilir, yeni
-PM'leri Telegram'a otomatik iletebilir ve overlay'li ekran görüntüleri kaydedebilirsiniz.
+Windows üzerinde çalışan bu uygulama, Merlis oyun penceresini DXCam ile yakalayıp PM panelini tespit eder, Tesseract OCR ile mesajı çözümler ve modern PyQt5 arayüzü üzerinden iki ayrı oyun istemcisini eş zamanlı olarak yönetmenizi sağlar. Yeni PM'lerin ekran görüntüleri Telegram'a gönderilir; Telegram üzerinden verdiğiniz yanıtlar otomatik olarak oyuna yazılır ve pencere güvenle kapatılır.
 
-## Özellikler
+## Öne Çıkan Özellikler
 
-- DXCam tabanlı pencere yakalama, Merlis sürecine PID ile kilitlenme
-- PM panelini ikon temelli template matching ile bulma
-- Tesseract + PyTesseract ile hızlı OCR ve checksum bazlı değişim takibi
-- 60 FPS canlı önizleme (ölçeklenebilir), 8–12 FPS OCR döngüsü
-- Yeni PM bulunduğunda ikon tıklama → PM penceresini açma → 271px sola / 178px yukarı metin alanına odaklanma → ekran görüntüsünü Telegram'a gönderme → otomatik cevap yazıp gönderme → pencereyi kapatma ve Space tuşuna basma akışı
-- Telegram'a hem ekran görüntüsü hem de PM kırpıntısı gönderimi
-- Tüm eşi̇kler, ROI ve OCR parametreleri GUI üzerinden ayarlanabilir
-- Otomatik cevap metni, koordinat offset'leri ve otomasyon toggle'ı GUI üzerinden ayarlanabilir
-- Ayarlar `config.json` dosyasında kalıcı olarak saklanır
-- Overlay'li ekran görüntüsünü `captures/` klasörüne kaydetme
-- Zaman damgalı log paneli, son tespit edilen mesaj listesi
+- **Çift istemci desteği:** Her iki Merlis penceresini bağımsız PID, ROI ve OCR ayarlarıyla izleyip otomasyon akışını ayrı ayrı başlatıp durdurabilirsiniz.
+- **60 FPS canlı önizleme:** DXCam + `get_latest_frame` ile hedef pencereyi yüksek FPS'te yakalar, önizlemeyi 0.5/0.75/1.0 ölçeğine göre hafifletir.
+- **Template matching tabanlı PM algısı:** `assets/pm_icon.png` ikonunu bulur, ikon kutusundan PM metin alanının ROI'sini çıkartır ve çakışmaları NMS ile sadeleştirir.
+- **Tesseract OCR:** Hafif Gaussian blur ön işleme sonrası Türkçe + İngilizce karma OCR yapılır, checksum ile değişim algılanır ve dedupe zaman penceresi uygulanır.
+- **Telegram köprüsü:** Yeni PM bulunduğunda Merlis penceresi öne getirilir, PM ikonu tıklanır, `pm_send_btn.png` ile gönder butonu bulunur, ekran görüntüsü & ROI Telegram'a gönderilir ve sizden yanıt beklenir. Telegram'da `#1 Merhaba` gibi ön ekli mesajla (veya yalnızca bir istemci bekliyorsa direkt mesajla) cevap verdiğinizde oyun penceresine otomatik yapıştırılır, gönderilir, pencere `pm_close_x.png` ile kapatılır ve Space tuşu tetiklenir. Gönderimin başarılı olduğu Telegram mesajıyla onaylanır.
+- **Modern koyu arayüz:** Sol tarafta gezinme listesi, sağda kart tasarımlı dashboard, canlı PM önizlemeleri, son 10 mesaj listesi ve zaman damgalı log paneli.
+- **Kalıcı ayarlar:** Telegram bilgileri, otomasyon şablonları, ROI ve OCR parametreleri `config.json` içinde yeni çift-istemci şemasında saklanır.
+- **Ekran görüntüsü arşivi:** Tek tıkla overlay'li kare `captures/` klasörüne tarih damgalı dosya olarak kaydedilir.
 
 ## Kurulum
 
@@ -26,11 +21,11 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-> Notlar:
+> **Notlar**
 > - `dxcam`, `pywin32` ve `psutil` yalnızca Windows üzerinde çalışır.
-> - `assets/` klasöründe `pm_icon.png`, `pm_close_x.png`, `pm_send_btn.png` dosyalarının bulunduğundan emin olun.
-> - OCR için Windows'a [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) yükleyin. Varsayılan yol `C:\\Program Files\\Tesseract-OCR\\tesseract.exe` olarak ayarlanır, farklıysa GUI üzerinden güncelleyebilirsiniz.
-> - PyTesseract yüklenemez veya Tesseract yolu bulunamazsa uygulama OCR'i devre dışı bırakıp log panelinde ayrıntılı bir hata mesajı gösterir.
+> - `assets/` klasöründe `pm_icon.png`, `pm_close_x.png`, `pm_send_btn.png` dosyalarının mevcut olduğundan emin olun.
+> - OCR için [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) kurulu olmalıdır. Varsayılan yol `C:\\Program Files\\Tesseract-OCR\\tesseract.exe` olarak gelir, farklıysa GUI'den güncelleyebilirsiniz.
+> - PyTesseract veya Tesseract yolu doğrulanamazsa uygulama OCR'i devre dışı bırakır ve log panelinde hata mesajı gösterir.
 
 ## Kullanım
 
@@ -38,29 +33,27 @@ pip install -r requirements.txt
 python app.py
 ```
 
-1. **Pencere / PID** sekmesinden Merlis sürecini otomatik bulabilir ya da PID değerini girebilirsiniz.
-2. Gerekirse ROI override alanlarını kullanarak manuel bir yakalama bölgesi tanımlayın.
-3. **Telegram** sekmesinden bot token ve chat ID bilgilerinizi girerek otomatik gönderimi etkinleştirin.
-4. **PM Algılama** sekmesindeki "PM otomasyonunu etkinleştir" seçeneği ile ikon tıklama, ekran görüntüsü gönderme ve otomatik cevap akışını kontrol edin; metin alanı offset'lerini gerekirse ayarlayın.
-5. Dashboard üzerinden "Başlat" düğmesine basarak canlı yakalamayı başlatın. Son PM'ler listede görüntülenir.
-6. "Ekran Görüntüsü Kaydet" düğmesi o anki overlay'li kareyi `captures/` klasörüne kaydeder.
+1. **Genel Bakış** sekmesinde iki istemci kartını görürsünüz. "Başlat" ile yakalamayı başlatabilir, "Durdur" ile sonlandırabilir, "Ekran Görüntüsü Kaydet" ile anlık kareyi arşivleyebilirsiniz.
+2. Her istemci için **Client 1 / Client 2** sayfalarında PID, süreç ipucu, ROI override, ikon/buton eşikleri, OCR periyodu ve otomasyon offset'lerini ayarlayın. "Merlis'i Bul (PID)" düğmesi süreç adından PID bulur.
+3. **Telegram & Otomasyon** sayfasında bot token ve chat ID'yi girin, otomatik gönderimi etkinleştirin ve mesaj/başlık şablonlarını, yanıt ön ekini (`#`) ve zaman aşımı değerlerini düzenleyin. "Telegram Test Mesajı Gönder" ile bağlantıyı doğrulayabilirsiniz.
+4. Yeni PM geldiğinde uygulama ekran görüntüsünü Telegram'a atar ve kart üzerinde "Yanıt bekleniyor" rozetini gösterir. Telegram'da `#1 cevap` (ya da yalnızca bir istemci bekliyorsa direkt mesaj) yazarak oyuna yanıt gönderebilirsiniz.
+5. Gönderim tamamlandığında Telegram'da onay mesajı gelir, PM penceresi kapanır ve Space tuşu tetiklenir. Başarısız adımlar log panelinde WARN/ERROR olarak görünür.
 
-## PM Otomasyonu Akışı
+## PM Otomasyon Akışı
 
-1. Yeni PM ikonu tespit edildiğinde uygulama Merlis penceresini öne çıkarır ve ikona tıklar.
-2. `pm_send_btn.png` şablonu bulunarak gönder butonunun merkezi hesaplanır.
-3. Buton merkezinden 271 piksel sola ve 178 piksel yukarı gidilerek metin kutusu odaklanır, son durumun ekran görüntüsü Telegram'a gönderilir.
-4. GUI'de tanımlı otomatik cevap metni panoya kopyalanıp yapıştırılır, gönder butonuna tıklanır.
-5. `pm_close_x.png` ile pencere kapatılır ve 0.5 saniye sonra Space tuşuna basılır.
-6. Her adım log paneline INFO/WARN/ERROR seviyesinde aktarılır; herhangi bir adım başarısız olursa klasik Telegram gönderimine geri düşülür.
+1. İkon tespit edilir, Merlis penceresi öne getirilir ve ikona tıklanır.
+2. `pm_send_btn.png` şablonu bulunur; buton merkezinden konfigüre ettiğiniz offset kadar sola/yukarı gidilerek metin alanı odaklanır.
+3. Tam pencere ekran görüntüsü ve ROI Telegram'a gönderilir, istemci "Yanıt bekleniyor" durumuna geçer.
+4. Telegram üzerinden gelen yanıt kuyruklanır, pencere odaklanır, metin panoya kopyalanıp yapıştırılır, gönder butonuna tıklanır.
+5. `pm_close_x.png` ile pencere kapatılır ve ayarlanmış gecikmeden sonra Space tuşu basılır.
+6. İşlem başarıyla tamamlanırsa Telegram'a "✅ PM gönderildi" şablonlu onay iletilir; zaman aşımında ise ⚠️ uyarısı gönderilir ve otomasyon güvenle bırakılır.
 
 ## Paketleme
 
-PyInstaller ile GUI'yi tek yürütülebilir dosya haline getirebilirsiniz:
+PyInstaller ile GUI'yi tek bir .exe dosyasına dönüştürebilirsiniz:
 
 ```bash
 pyinstaller --noconsole --name "MerlisPMBot" app.py --add-data "assets;assets"
 ```
 
-Ortaya çıkan `dist/MerlisPMBot.exe` dosyası tek başına çalıştırılabilir.
-
+`dist/MerlisPMBot.exe` dosyasını bağımsız olarak çalıştırabilirsiniz.
