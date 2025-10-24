@@ -2,9 +2,8 @@ PyQt5
 opencv-python
 numpy
 dxcam
-rapidocr-onnxruntime
-onnxruntime
 requests
 pywin32
 psutil
 Pillow
+pytesseract

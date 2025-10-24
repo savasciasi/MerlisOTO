@@ -67,7 +67,10 @@ class CaptureWorker(QThread):
         self._ocr_error_reported = False
         self.initialization_error: Optional[str] = None
         try:
-            self._ocr_engine = OCREngine(use_gpu=config.get("ocr_use_gpu", True))
+            self._ocr_engine = OCREngine(
+                tesseract_path=config.get("tesseract_path"),
+                language=config.get("ocr_lang", "tur+eng"),
+            )
         except OCREngineError as exc:
             self.initialization_error = str(exc)
             self._ocr_engine = None
@@ -363,6 +366,19 @@ class MainWindow(QMainWindow):
             lambda state: self._update_config("checksum_enabled", state == Qt.Checked)
         )
 
+        tesseract_edit = QLineEdit(self.config.get("tesseract_path", ""))
+        tesseract_edit.setPlaceholderText(r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe")
+        tesseract_edit.textChanged.connect(
+            lambda text: self._update_config("tesseract_path", text.strip())
+        )
+
+        ocr_lang_edit = QLineEdit(self.config.get("ocr_lang", "tur+eng"))
+        ocr_lang_edit.setPlaceholderText("tur+eng")
+        ocr_lang_edit.setToolTip("Tesseract dil kodlarını '+' ile birleştirerek giriniz. Örn: tur+eng")
+        ocr_lang_edit.textChanged.connect(
+            lambda text: self._update_config("ocr_lang", text.strip() or "eng")
+        )
+
         scale_combo = QComboBox()
         for label, value in [("0.5", 0.5), ("0.75", 0.75), ("1.0", 1.0)]:
             scale_combo.addItem(label, value)
@@ -384,6 +400,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(checksum_box, 4, 0, 1, 2)
         layout.addWidget(QLabel("Önizleme ölçeği"), 5, 0)
         layout.addWidget(scale_combo, 5, 1)
+        layout.addWidget(QLabel("Tesseract yolu"), 6, 0)
+        layout.addWidget(tesseract_edit, 6, 1)
+        layout.addWidget(QLabel("OCR dil (ör. tur+eng)"), 7, 0)
+        layout.addWidget(ocr_lang_edit, 7, 1)
 
         return tab
 
@@ -535,8 +555,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "OCR Başlatılamadı",
-                "RapidOCR/ONNXRuntime doğru yüklenmediği için OCR devre dışı bırakıldı.\n"
-                "Kurulumu kontrol edip uygulamayı yeniden başlatın.",
+                "Tesseract veya PyTesseract doğru yapılandırılamadığı için OCR devre dışı bırakıldı.\n"
+                "Tesseract kurulumunu ve yol ayarını kontrol edip uygulamayı yeniden başlatın.",
             )
             worker._ocr_error_reported = True
         self.capture_thread.start()
