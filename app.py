@@ -75,6 +75,8 @@ class DetectionWorker(QThread):
         self._telegram_client: Optional[TelegramClient] = None
         self._last_event = "Hazır"
         self._fps_counter = SlidingWindowFPS()
+        self._last_detection_error: Optional[str] = None
+        self._last_telegram_error: Optional[str] = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -121,9 +123,10 @@ class DetectionWorker(QThread):
                 labels=labels,
             )
         except Exception as exc:
-            self.logMessage.emit("ERROR", f"Tahmin yapılamadı: {exc}")
-            self.stop()
+            self._handle_prediction_failure(frame, str(exc))
             return
+
+        self._clear_prediction_error()
 
         filtered = [d for d in detections if d.label == PLAYER_LABEL or self._state.detection.enable_pm_box]
         if self._state.detection.show_only_player:
@@ -148,20 +151,49 @@ class DetectionWorker(QThread):
                 preview = convert_frame_to_qimage(cropped)
                 self.pmPreviewReady.emit(preview)
                 if self._state.telegram.auto_send:
-                    if self._telegram_client is None and self._state.telegram.bot_token:
-                        credentials = TelegramCredentials(
-                            bot_token=self._state.telegram.bot_token,
-                            chat_id=self._state.telegram.chat_id,
-                        )
-                        self._telegram_client = TelegramClient(credentials)
-                    if self._telegram_client:
-                        try:
-                            self._telegram_client.send_image(cropped, caption="Yeni PM tespiti")
-                            self._last_event = "PM kutusu gönderildi"
-                            self.logMessage.emit("INFO", "PM kutusu Telegram'a gönderildi.")
-                        except Exception as exc:
-                            self.logMessage.emit("ERROR", f"Telegram hatası: {exc}")
+                    if not self._state.telegram.bot_token or not self._state.telegram.chat_id:
+                        self._log_telegram_error("Telegram bot token veya chat ID ayarlanmadı.")
+                    else:
+                        if self._telegram_client is None:
+                            credentials = TelegramCredentials(
+                                bot_token=self._state.telegram.bot_token,
+                                chat_id=self._state.telegram.chat_id,
+                            )
+                            self._telegram_client = TelegramClient(credentials)
+                        if self._telegram_client:
+                            try:
+                                self._telegram_client.send_image(cropped, caption="Yeni PM tespiti")
+                                self._last_event = "PM kutusu gönderildi"
+                                self.logMessage.emit("INFO", "PM kutusu Telegram'a gönderildi.")
+                                self._clear_telegram_error()
+                            except Exception as exc:
+                                self._log_telegram_error(str(exc))
+                                self._telegram_client = None
                 break
+
+    def _handle_prediction_failure(self, frame: np.ndarray, message: str) -> None:
+        formatted = message if message.startswith("Tahmin") else f"Tahmin yapılamadı: {message}"
+        if self._last_detection_error != formatted:
+            self.logMessage.emit("ERROR", formatted)
+            self._last_detection_error = formatted
+        self._last_event = "Tahmin hatası"
+        fps = self._fps_counter.update()
+        qimage = convert_frame_to_qimage(frame)
+        self.frameReady.emit(qimage, [])
+        self.statsUpdated.emit(fps, self._last_event)
+        time.sleep(0.5)
+
+    def _clear_prediction_error(self) -> None:
+        self._last_detection_error = None
+
+    def _log_telegram_error(self, message: str) -> None:
+        formatted = f"Telegram mesajı gönderilemedi: {message}"
+        if self._last_telegram_error != formatted:
+            self.logMessage.emit("ERROR", formatted)
+            self._last_telegram_error = formatted
+
+    def _clear_telegram_error(self) -> None:
+        self._last_telegram_error = None
 
 
 class LogPanel:

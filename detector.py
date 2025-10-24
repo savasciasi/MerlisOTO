@@ -59,10 +59,31 @@ class RoboflowDetector:
             return
         if Roboflow is None:
             raise RuntimeError("roboflow paketi yüklenemedi. Lütfen kurulu olduğundan emin olun.")
-        rf = Roboflow(api_key=self.api_key)
-        project = rf.workspace(self.workspace).project(self.project)
-        self._model = project.version(self.version).model
-        self._last_load_error = None
+        api_key = (self.api_key or "").strip()
+        workspace = (self.workspace or "").strip()
+        project_name = (self.project or "").strip()
+        if not workspace or not project_name:
+            raise RuntimeError(
+                "Roboflow workspace ve proje bilgileri boş olamaz. Lütfen ayarları güncelleyin."
+            )
+        try:
+            rf = Roboflow(api_key=api_key)
+            workspace_ref = rf.workspace(workspace)
+            project = workspace_ref.project(project_name)
+            self._model = project.version(self.version).model
+            self._last_load_error = None
+        except Exception as exc:  # pragma: no cover - depends on external API
+            self._model = None
+            message = str(exc)
+            if "missing permissions" in message or "Unsupported request" in message:
+                friendly = (
+                    "Roboflow kimlik bilgileri doğrulanamadı. API anahtarını ve "
+                    "workspace/proje ayarlarını kontrol edin."
+                )
+            else:
+                friendly = "Roboflow modeli yüklenemedi."
+            self._last_load_error = friendly
+            raise RuntimeError(f"{friendly} (Detay: {message})") from exc
 
     def predict(
         self,
