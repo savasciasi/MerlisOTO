@@ -259,6 +259,8 @@ class CaptureWorker(QThread):
             "dedupe_window",
             "yellow_dedupe_window",
             "yellow_fill_ratio",
+            "yellow_edge_ratio",
+            "yellow_white_ratio",
         }:
             self.client_config[key] = float(value)
         elif key in {
@@ -438,6 +440,8 @@ class CaptureWorker(QThread):
         padding = int(self.client_config.get("yellow_padding", 60))
         dedupe_window = float(self.client_config.get("yellow_dedupe_window", 12.0))
         fill_ratio_thr = float(self.client_config.get("yellow_fill_ratio", 0.3))
+        edge_ratio_thr = float(self.client_config.get("yellow_edge_ratio", 0.12))
+        white_ratio_thr = float(self.client_config.get("yellow_white_ratio", 0.08))
         now = time.time()
         events: List[Dict[str, Any]] = []
         full_frame: Optional[np.ndarray] = None
@@ -458,6 +462,12 @@ class CaptureWorker(QThread):
             fill_ratio = float(cv2.countNonZero(roi_mask)) / roi_area
             if fill_ratio < max(0.05, fill_ratio_thr):
                 continue
+            roi_color = frame[y : y + h, x : x + w]
+            roi_gray = cv2.cvtColor(roi_color, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(roi_gray, 40, 120)
+            edge_ratio = float(cv2.countNonZero(edges)) / roi_area
+            if edge_ratio < max(0.01, edge_ratio_thr):
+                continue
             x1 = max(0, x - padding)
             y1 = max(0, y - padding)
             x2 = min(frame.shape[1], x + w + padding)
@@ -468,8 +478,19 @@ class CaptureWorker(QThread):
             text_roi_left = max(0, x - padding)
             text_roi_right = min(frame.shape[1], x + w + padding)
             text_roi = frame[text_roi_top:text_roi_bottom, text_roi_left:text_roi_right].copy()
+            if text_roi.size == 0:
+                continue
+            white_hsv = cv2.cvtColor(text_roi, cv2.COLOR_BGR2HSV)
+            white_mask = cv2.inRange(
+                white_hsv,
+                np.array([0, 0, 200], dtype=np.uint8),
+                np.array([180, 60, 255], dtype=np.uint8),
+            )
+            white_ratio = float(cv2.countNonZero(white_mask)) / max(1.0, float(text_roi.shape[0] * text_roi.shape[1]))
+            if white_ratio < max(0.01, white_ratio_thr):
+                continue
             detected_text: Optional[str] = None
-            if text_roi.size > 0 and self._ocr_engine is not None:
+            if self._ocr_engine is not None:
                 try:
                     candidate = self._ocr_engine.read(text_roi)
                 except OCREngineError as exc:
@@ -477,8 +498,11 @@ class CaptureWorker(QThread):
                         self.logMessage.emit(self.client_index, "ERROR", str(exc))
                         self._ocr_error_reported = True
                 else:
-                    if candidate:
+                    min_len = int(self.client_config.get("new_msg_min_len", 2))
+                    if candidate and len(candidate.strip()) >= max(1, min_len):
                         detected_text = candidate
+            if not detected_text:
+                continue
             text_signature = hashlib.md5((detected_text or "").encode("utf-8", "ignore")).hexdigest()[:6]
             key = f"{int(x/10)}-{int(y/10)}-{int(w/10)}-{int(h/10)}-{text_signature}"
             last = self._yellow_history.get(key, 0.0)
@@ -1471,6 +1495,26 @@ class MainWindow(QMainWindow):
             lambda value, i=idx: self._update_client_config(i, "yellow_fill_ratio", float(value))
         )
         yellow_form.addRow("Doldurma oranı", yellow_fill)
+
+        yellow_edge = QDoubleSpinBox()
+        yellow_edge.setRange(0.01, 1.0)
+        yellow_edge.setDecimals(2)
+        yellow_edge.setSingleStep(0.01)
+        yellow_edge.setValue(float(client_cfg.get("yellow_edge_ratio", 0.12)))
+        yellow_edge.valueChanged.connect(
+            lambda value, i=idx: self._update_client_config(i, "yellow_edge_ratio", float(value))
+        )
+        yellow_form.addRow("Kenar yoğunluğu", yellow_edge)
+
+        yellow_white = QDoubleSpinBox()
+        yellow_white.setRange(0.01, 1.0)
+        yellow_white.setDecimals(2)
+        yellow_white.setSingleStep(0.01)
+        yellow_white.setValue(float(client_cfg.get("yellow_white_ratio", 0.08)))
+        yellow_white.valueChanged.connect(
+            lambda value, i=idx: self._update_client_config(i, "yellow_white_ratio", float(value))
+        )
+        yellow_form.addRow("Beyaz metin oranı", yellow_white)
         form_layout.addWidget(yellow_box)
 
         automation_box = QGroupBox("Otomasyon")

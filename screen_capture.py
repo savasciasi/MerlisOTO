@@ -62,74 +62,58 @@ def _resolve_output_region(region: Rect) -> Tuple[Optional[int], Rect, Optional[
 
     monitors = _monitor_rects()
     bounds = _virtual_bounds()
+
+    def _clamp_axis(start: int, end: int, maximum: int) -> Tuple[int, int]:
+        if maximum <= 1:
+            return 0, 1
+        left = max(0, min(maximum - 1, start))
+        right = max(left + 1, min(maximum, end))
+        return left, right
+
     monitor_idx: Optional[int] = None
     monitor_rect: Optional[Rect] = None
     if monitors:
-        cx = int((region[0] + region[2]) / 2)
-        cy = int((region[1] + region[3]) / 2)
+        best_overlap = 0
         for idx, (ml, mt, mr, mb) in enumerate(monitors):
-            if ml <= cx < mr and mt <= cy < mb:
+            overlap_left = max(region[0], ml)
+            overlap_top = max(region[1], mt)
+            overlap_right = min(region[2], mr)
+            overlap_bottom = min(region[3], mb)
+            overlap_w = max(0, overlap_right - overlap_left)
+            overlap_h = max(0, overlap_bottom - overlap_top)
+            overlap = overlap_w * overlap_h
+            if overlap > best_overlap:
+                best_overlap = overlap
                 monitor_idx = idx
                 monitor_rect = (ml, mt, mr, mb)
-                break
     if monitor_rect is not None:
         ml, mt, mr, mb = monitor_rect
-        rel = (
-            int(region[0] - ml),
-            int(region[1] - mt),
-            int(region[2] - ml),
-            int(region[3] - mt),
-        )
         width = max(1, mr - ml)
         height = max(1, mb - mt)
-
-        def _clamp(value: int, maximum: int) -> int:
-            return max(0, min(maximum, value))
-
-        left = _clamp(rel[0], width)
-        top = _clamp(rel[1], height)
-        right = _clamp(rel[2], width)
-        bottom = _clamp(rel[3], height)
-        if right <= left:
-            right = min(width, left + max(1, region[2] - region[0]))
-        if bottom <= top:
-            bottom = min(height, top + max(1, region[3] - region[1]))
-
-        # dxcam expects the region to stay strictly within the monitor bounds.
-        right = min(width, max(left + 1, right))
-        bottom = min(height, max(top + 1, bottom))
-
+        rel_left = int(region[0] - ml)
+        rel_top = int(region[1] - mt)
+        rel_right = int(region[2] - ml)
+        rel_bottom = int(region[3] - mt)
+        left, right = _clamp_axis(rel_left, rel_right, width)
+        top, bottom = _clamp_axis(rel_top, rel_bottom, height)
         capture_region = (left, top, right, bottom)
         if capture_region[2] > capture_region[0] and capture_region[3] > capture_region[1]:
             return monitor_idx, capture_region, None, monitor_rect
 
     if bounds is None:
         return None, region, None, None
+
     left, top, right, bottom = bounds
-    shift_x = -left
-    shift_y = -top
-    x1 = int(region[0] + shift_x)
-    y1 = int(region[1] + shift_y)
-    x2 = int(region[2] + shift_x)
-    y2 = int(region[3] + shift_y)
     width = max(1, right - left)
     height = max(1, bottom - top)
-    inside = 0 <= x1 < width and 0 <= y1 < height and 0 < x2 <= width and 0 < y2 <= height
-    needs_union = (region[0] < left or region[1] < top) or not inside
-    if needs_union:
-        capture_region = (0, 0, width, height)
-        crop_rect = (
-            max(0, min(width, x1)),
-            max(0, min(height, y1)),
-            max(0, min(width, x2)),
-            max(0, min(height, y2)),
-        )
-    else:
-        right = min(width, max(x1 + 1, x2))
-        bottom = min(height, max(y1 + 1, y2))
-        capture_region = (max(0, x1), max(0, y1), right, bottom)
-        crop_rect = None
-    return None, capture_region, crop_rect, bounds
+    rel_left = int(region[0] - left)
+    rel_top = int(region[1] - top)
+    rel_right = int(region[2] - left)
+    rel_bottom = int(region[3] - top)
+    cap_left, cap_right = _clamp_axis(rel_left, rel_right, width)
+    cap_top, cap_bottom = _clamp_axis(rel_top, rel_bottom, height)
+    capture_region = (cap_left, cap_top, cap_right, cap_bottom)
+    return None, capture_region, None, bounds
 
 
 def find_pid_by_name(substr: str) -> Optional[int]:

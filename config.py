@@ -39,6 +39,8 @@ DEFAULT_CLIENT: Dict[str, Any] = {
     "yellow_padding": 60,
     "yellow_dedupe_window": 12.0,
     "yellow_fill_ratio": 0.3,
+    "yellow_edge_ratio": 0.12,
+    "yellow_white_ratio": 0.08,
 }
 
 DEFAULT_GLOBAL: Dict[str, Any] = {
