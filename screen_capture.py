@@ -82,12 +82,24 @@ def _resolve_output_region(region: Rect) -> Tuple[Optional[int], Rect, Optional[
         )
         width = max(1, mr - ml)
         height = max(1, mb - mt)
-        capture_region = (
-            max(0, min(width, rel[0])),
-            max(0, min(height, rel[1])),
-            max(0, min(width, rel[2])),
-            max(0, min(height, rel[3])),
-        )
+
+        def _clamp(value: int, maximum: int) -> int:
+            return max(0, min(maximum, value))
+
+        left = _clamp(rel[0], width)
+        top = _clamp(rel[1], height)
+        right = _clamp(rel[2], width)
+        bottom = _clamp(rel[3], height)
+        if right <= left:
+            right = min(width, left + max(1, region[2] - region[0]))
+        if bottom <= top:
+            bottom = min(height, top + max(1, region[3] - region[1]))
+
+        # dxcam expects the region to stay strictly within the monitor bounds.
+        right = min(width, max(left + 1, right))
+        bottom = min(height, max(top + 1, bottom))
+
+        capture_region = (left, top, right, bottom)
         if capture_region[2] > capture_region[0] and capture_region[3] > capture_region[1]:
             return monitor_idx, capture_region, None, monitor_rect
 
@@ -113,7 +125,9 @@ def _resolve_output_region(region: Rect) -> Tuple[Optional[int], Rect, Optional[
             max(0, min(height, y2)),
         )
     else:
-        capture_region = (x1, y1, x2, y2)
+        right = min(width, max(x1 + 1, x2))
+        bottom = min(height, max(y1 + 1, y2))
+        capture_region = (max(0, x1), max(0, y1), right, bottom)
         crop_rect = None
     return None, capture_region, crop_rect, bounds
 
@@ -183,7 +197,11 @@ class DXCapture:
                 if self._output_idx is not None:
                     create_kwargs["output_idx"] = self._output_idx
                 self._cam = dxcam.create(**create_kwargs)
-                self._cam.start(region=capture_region, target_fps=self.target_fps)
+                try:
+                    self._cam.start(region=capture_region, target_fps=self.target_fps)
+                except Exception as exc:
+                    self._cam = None
+                    raise RuntimeError(f"dxcam başlatılamadı: {exc}") from exc
 
     def get_latest_frame(self) -> Optional[np.ndarray]:
         with self._lock:

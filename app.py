@@ -34,10 +34,11 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
-    QStackedWidget,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QSizePolicy,
 )
 
 from automation import bring_window_to_front, click_left, paste_text_via_clipboard, press_enter, send_space
@@ -302,7 +303,10 @@ class CaptureWorker(QThread):
             self._capture = DXCapture(region=region, prefer_dx=bool(self.client_config.get("dx_prefer", True)))
             self._capture.start()
         except Exception as exc:  # pragma: no cover - hardware interaction
-            self.logMessage.emit(self.client_index, "ERROR", f"dxcam başlatılamadı: {exc}")
+            message = str(exc)
+            if "Invalid Region" in message:
+                message += " — seçilen pencere koordinatlarını hedef monitör çözünürlüğü içinde olacak şekilde güncelleyin."
+            self.logMessage.emit(self.client_index, "ERROR", f"dxcam başlatılamadı: {message}")
             return
         if self._window_hwnd:
             bring_window_to_front(self._window_hwnd)
@@ -924,8 +928,8 @@ class MainWindow(QMainWindow):
         self.config = load_config()
         self.client_states = [ClientUIState(config=c) for c in self.config.get("clients", [])]
         self.log_view: Optional[QTextEdit] = None
-        self.stack: Optional[QStackedWidget] = None
-        self.nav_buttons: list[QPushButton] = []
+        self.tabs: Optional[QTabWidget] = None
+        self.summary_label: Optional[QLabel] = None
         self.telegram_sender = TelegramClient(
             self.config.get("global", {}).get("telegram_token", ""),
             self.config.get("global", {}).get("telegram_chat_id", ""),
@@ -957,61 +961,54 @@ class MainWindow(QMainWindow):
             app.setPalette(palette)
         self.setStyleSheet(
             """
-            QMainWindow { background-color: #0f172a; }
-            QFrame#NavPanel {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #111c2e, stop:1 #0b1220);
-                border-radius: 24px;
-                border: 1px solid #1e2b44;
+            QMainWindow { background-color: #050b18; }
+            QFrame#HeaderFrame {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #18233b, stop:1 #0f1728);
+                border-radius: 28px;
+                border: 1px solid rgba(68, 89, 134, 0.45);
+                padding: 28px;
             }
-            QLabel#BrandTitle {
-                color: #f8fafc;
-                font-size: 22px;
+            QLabel#HeaderTitle {
+                color: #f5f7ff;
+                font-size: 26px;
                 font-weight: 700;
             }
-            QLabel#BrandSubtitle {
-                color: #9fb3d1;
-                font-size: 12px;
+            QLabel#HeaderSubtitle {
+                color: #95a9d6;
+                font-size: 13px;
             }
-            QPushButton#NavButton {
+            QTabWidget#MainTabs::pane {
+                border: 1px solid #16213b;
+                border-radius: 22px;
+                padding: 12px;
+                margin-top: 12px;
+                background: rgba(10, 16, 29, 0.88);
+            }
+            QTabBar::tab {
                 background-color: transparent;
-                color: #c7d5f5;
+                color: #9bb1df;
                 border: none;
-                text-align: left;
-                padding: 12px 18px;
-                border-radius: 12px;
+                padding: 12px 28px;
+                margin: 8px 6px;
+                border-radius: 20px;
                 font-size: 14px;
                 font-weight: 600;
             }
-            QPushButton#NavButton:hover {
-                background-color: rgba(61, 125, 255, 0.14);
-                color: #f1f5ff;
+            QTabBar::tab:hover {
+                background-color: rgba(74, 116, 255, 0.18);
+                color: #f0f5ff;
             }
-            QPushButton#NavButton:checked {
-                background-color: #3d7dff;
+            QTabBar::tab:selected {
+                background-color: #4a74ff;
                 color: #ffffff;
             }
-            QFrame#ContentFrame { background: transparent; }
-            QFrame#HeroBanner {
-                background: rgba(33, 47, 75, 0.85);
-                border: 1px solid #24324d;
-                border-radius: 20px;
-                padding: 20px;
-            }
-            QLabel#HeroTitle {
-                font-size: 24px;
-                font-weight: 700;
-                color: #f8fbff;
-            }
-            QLabel#HeroSubtitle {
-                color: #a9b8d9;
-                font-size: 13px;
-            }
             QFrame#Card {
-                background-color: #141c2f;
-                border: 1px solid #1f2b46;
-                border-radius: 20px;
+                background-color: rgba(17, 26, 43, 0.92);
+                border: 1px solid rgba(54, 74, 115, 0.55);
+                border-radius: 22px;
+                padding: 18px;
             }
-            QLabel { color: #e8eef9; }
+            QLabel { color: #e3ebff; }
             QLabel#TitleLabel { font-size: 20px; font-weight: 600; }
             QLabel#AwaitBadge {
                 background-color: #22d3ee;
@@ -1020,158 +1017,171 @@ class MainWindow(QMainWindow):
                 border-radius: 12px;
                 font-weight: 600;
             }
-            QLabel#StatusLabel { color: #7dd3fc; font-weight: 600; }
+            QLabel#StatusLabel { color: #6bdcff; font-weight: 600; }
             QLabel#FpsLabel { color: #a5b4fc; font-weight: 600; }
             QPushButton {
-                background-color: #1c2539;
+                background-color: #1a2540;
                 color: #f0f4ff;
-                border-radius: 10px;
-                padding: 9px 20px;
-                border: 1px solid #27334a;
+                border-radius: 12px;
+                padding: 10px 22px;
+                border: 1px solid rgba(71, 96, 151, 0.6);
+                font-weight: 600;
             }
-            QPushButton:hover { background-color: #26304a; }
+            QPushButton:hover { background-color: #25325a; }
             QPushButton#PrimaryButton {
-                background-color: #3d7dff;
-                border-color: #3d7dff;
+                background-color: #4a74ff;
+                border-color: #4a74ff;
                 color: #ffffff;
             }
-            QPushButton#PrimaryButton:hover { background-color: #356ceb; }
+            QPushButton#PrimaryButton:hover { background-color: #3a63e9; }
             QPushButton#DangerButton {
                 background-color: #ef4444;
                 border-color: #ef4444;
                 color: #ffffff;
             }
             QPushButton#DangerButton:hover { background-color: #dc2626; }
-            QListWidget {
-                background-color: #121a2d;
-                border: none;
-                padding: 12px;
-                color: #d6deeb;
-                border-radius: 16px;
+            QListWidget#LastMessages {
+                background-color: #0f172a;
+                border: 1px solid rgba(50, 69, 107, 0.6);
+                border-radius: 14px;
             }
-            QListWidget::item { border-radius: 12px; padding: 12px; margin: 2px 0; }
-            QListWidget::item:selected { background-color: rgba(61, 125, 255, 0.25); color: #ffffff; }
-            QGroupBox {
-                border: 1px solid #25324b;
+            QListWidget#LastMessages::item {
+                padding: 6px 10px;
+                color: #dbe6ff;
+            }
+            QListWidget#LastMessages::item:selected {
+                background-color: rgba(74, 116, 255, 0.32);
+            }
+            QTextEdit#LogView {
+                background-color: rgba(10, 16, 30, 0.95);
+                border: 1px solid rgba(53, 73, 115, 0.65);
                 border-radius: 18px;
-                margin-top: 20px;
-                color: #9fa9c1;
+                padding: 16px;
+                color: #c7d2eb;
+            }
+            QScrollArea {
+                background: transparent;
+                border: none;
+            }
+            QGroupBox {
+                border: 1px solid rgba(49, 68, 107, 0.7);
+                border-radius: 18px;
+                margin-top: 18px;
+                padding: 18px;
+                background: rgba(12, 20, 33, 0.85);
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 18px;
+                padding: 0 8px;
+                color: #7aa8ff;
                 font-weight: 600;
             }
-            QGroupBox::title { subcontrol-origin: margin; left: 18px; padding: 0 6px; }
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {
-                background-color: #16223a;
-                color: #f0f4ff;
-                border: 1px solid #273142;
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+                background-color: rgba(8, 13, 25, 0.9);
+                border: 1px solid rgba(66, 90, 143, 0.65);
                 border-radius: 10px;
-                padding: 8px 10px;
+                padding: 8px 12px;
+                color: #e5edff;
             }
-            QTextEdit { min-height: 140px; }
-            QCheckBox { color: #d6deeb; }
-            QScrollArea { border: none; }
-            QListWidget#LastMessages { background-color: #131c30; border: 1px solid #23304b; border-radius: 14px; }
-            QTextEdit#LogView { background-color: #131c30; border: 1px solid #23304b; border-radius: 14px; }
+            QCheckBox { color: #d0dcff; }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+            }
+            QCheckBox::indicator:unchecked {
+                border: 1px solid rgba(62, 84, 129, 0.7);
+                background: rgba(12, 17, 30, 0.9);
+            }
+            QCheckBox::indicator:checked {
+                border: 1px solid #4a74ff;
+                background: #4a74ff;
+            }
             """
         )
 
     def _build_ui(self) -> None:
         central = QWidget()
-        root_layout = QHBoxLayout(central)
-        root_layout.setContentsMargins(24, 24, 24, 24)
+        root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(28, 26, 28, 28)
         root_layout.setSpacing(24)
 
-        nav_panel = QFrame()
-        nav_panel.setObjectName("NavPanel")
-        nav_layout = QVBoxLayout(nav_panel)
-        nav_layout.setContentsMargins(20, 28, 20, 28)
-        nav_layout.setSpacing(18)
+        header = QFrame()
+        header.setObjectName("HeaderFrame")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(18)
 
-        brand = QLabel("Merlis PM")
-        brand.setObjectName("BrandTitle")
-        brand_sub = QLabel("Çift Merlis istemcisi için gerçek zamanlı PM yakalama ve otomasyon")
-        brand_sub.setObjectName("BrandSubtitle")
-        brand_sub.setWordWrap(True)
-        nav_layout.addWidget(brand)
-        nav_layout.addWidget(brand_sub)
-        nav_layout.addSpacing(12)
+        title_block = QVBoxLayout()
+        title = QLabel("Merlis PM Kontrol Merkezi")
+        title.setObjectName("HeaderTitle")
+        subtitle = QLabel("DXCam, Tesseract OCR ve Telegram otomasyonu ile iki istemciyi tek ekrandan yönetin.")
+        subtitle.setObjectName("HeaderSubtitle")
+        subtitle.setWordWrap(True)
+        title_block.addWidget(title)
+        title_block.addWidget(subtitle)
+        header_layout.addLayout(title_block, 1)
 
-        nav_titles = [
-            "Kontrol Merkezi",
-            self.config["clients"][0].get("name", "Client 1"),
-            self.config["clients"][1].get("name", "Client 2"),
-            "Telegram & Otomasyon",
-            "Loglar",
-        ]
-        self.nav_buttons = []
-        for index, title in enumerate(nav_titles):
-            button = QPushButton(title)
-            button.setObjectName("NavButton")
-            button.setCheckable(True)
-            button.setAutoExclusive(True)
-            button.clicked.connect(lambda checked, i=index: self._navigate(i))
-            nav_layout.addWidget(button)
-            self.nav_buttons.append(button)
+        stats_block = QVBoxLayout()
+        stats_block.setSpacing(4)
+        stats_label = QLabel("Aktif Otomasyon")
+        stats_label.setStyleSheet("color: #8fa7d8; font-size: 12px; text-transform: uppercase; letter-spacing: 1px;")
+        total_clients = max(1, len(self.client_states))
+        active_clients = sum(1 for state in self.client_states if state.worker and state.worker.isRunning())
+        stats_value = QLabel(f"{active_clients}/{total_clients} istemci")
+        stats_value.setStyleSheet("color: #ffffff; font-size: 18px; font-weight: 600;")
+        self.summary_label = stats_value
+        stats_block.addWidget(stats_label)
+        stats_block.addWidget(stats_value)
+        stats_block.addStretch()
+        stats_widget = QWidget()
+        stats_widget.setLayout(stats_block)
+        stats_widget.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        header_layout.addWidget(stats_widget, 0, Qt.AlignRight | Qt.AlignVCenter)
 
-        nav_layout.addStretch()
-        root_layout.addWidget(nav_panel)
+        root_layout.addWidget(header)
 
-        content = QFrame()
-        content.setObjectName("ContentFrame")
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(24)
-
-        hero = QFrame()
-        hero.setObjectName("HeroBanner")
-        hero_layout = QVBoxLayout(hero)
-        hero_layout.setContentsMargins(18, 18, 18, 18)
-        hero_layout.setSpacing(6)
-        hero_title = QLabel("Merlis PM Kontrol Merkezi")
-        hero_title.setObjectName("HeroTitle")
-        hero_desc = QLabel(
-            "dxcam yakalama, Tesseract OCR ve Telegram otomasyonu ile iki Merlis istemcisini tek panelden yönetin."
-        )
-        hero_desc.setObjectName("HeroSubtitle")
-        hero_desc.setWordWrap(True)
-        hero_layout.addWidget(hero_title)
-        hero_layout.addWidget(hero_desc)
-        content_layout.addWidget(hero)
-
-        self.stack = QStackedWidget()
-        content_layout.addWidget(self.stack, 1)
-
-        root_layout.addWidget(content, 1)
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("MainTabs")
+        self.tabs.setTabPosition(QTabWidget.North)
+        self.tabs.setDocumentMode(True)
+        self.tabs.setMovable(False)
+        self.tabs.setUsesScrollButtons(True)
 
         overview = self._build_overview_page()
         client_pages = [self._build_client_page(0), self._build_client_page(1)]
         telegram_page = self._build_telegram_page()
         logs_page = self._build_logs_page()
 
-        self.stack.addWidget(overview)
-        self.stack.addWidget(client_pages[0])
-        self.stack.addWidget(client_pages[1])
-        self.stack.addWidget(telegram_page)
-        self.stack.addWidget(logs_page)
+        self.tabs.addTab(overview, "Kontrol Paneli")
+        self.tabs.addTab(client_pages[0], self.config["clients"][0].get("name", "İstemci 1"))
+        self.tabs.addTab(client_pages[1], self.config["clients"][1].get("name", "İstemci 2"))
+        self.tabs.addTab(telegram_page, "Telegram & Otomasyon")
+        self.tabs.addTab(logs_page, "Loglar")
 
+        root_layout.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
-        self._navigate(0)
-        self._refresh_navigation_titles()
+        self._refresh_tab_titles()
+        self._refresh_summary_badge()
 
-    def _navigate(self, index: int) -> None:
-        if not self.stack:
+    def _refresh_summary_badge(self) -> None:
+        if not self.summary_label:
             return
-        index = max(0, min(index, self.stack.count() - 1))
-        self.stack.setCurrentIndex(index)
-        for idx, button in enumerate(self.nav_buttons):
-            if button:
-                button.setChecked(idx == index)
+        total_clients = max(1, len(self.client_states))
+        active_clients = sum(1 for state in self.client_states if state.worker and state.worker.isRunning())
+        self.summary_label.setText(f"{active_clients}/{total_clients} istemci")
 
-    def _refresh_navigation_titles(self) -> None:
-        for idx, state in enumerate(self.client_states[:2]):
-            name = state.config.get("name", f"Client {idx + 1}")
-            button_index = 1 + idx
-            if button_index < len(self.nav_buttons):
-                self.nav_buttons[button_index].setText(name)
+    def _refresh_tab_titles(self) -> None:
+        if not self.tabs:
+            return
+        self.tabs.setTabText(0, "Kontrol Paneli")
+        for idx in range(min(2, len(self.client_states))):
+            name = self.config["clients"][idx].get("name", f"İstemci {idx + 1}")
+            self.tabs.setTabText(1 + idx, name)
+        if self.tabs.count() > 3:
+            self.tabs.setTabText(3, "Telegram & Otomasyon")
+        if self.tabs.count() > 4:
+            self.tabs.setTabText(4, "Loglar")
 
     def _build_overview_page(self) -> QWidget:
         page = QWidget()
@@ -1610,6 +1620,7 @@ class MainWindow(QMainWindow):
         worker.finished.connect(lambda i=idx: self._on_worker_finished(i))
         worker.start()
         self.append_log("INFO", f"{state.config.get('name', f'Client {idx + 1}')} başlatıldı.")
+        self._refresh_summary_badge()
 
     def stop_client(self, idx: int) -> None:
         state = self.client_states[idx]
@@ -1623,6 +1634,7 @@ class MainWindow(QMainWindow):
         if state.status_label:
             state.status_label.setText("Durduruldu")
         self.append_log("INFO", f"{state.config.get('name', f'Client {idx + 1}')} durduruldu.")
+        self._refresh_summary_badge()
 
     def save_screenshot(self, idx: int) -> None:
         state = self.client_states[idx]
@@ -1681,6 +1693,7 @@ class MainWindow(QMainWindow):
         state.worker = None
         if state.status_label:
             state.status_label.setText("Durduruldu")
+        self._refresh_summary_badge()
 
     def _on_telegram_message(self, payload: Dict[str, Any]) -> None:
         text = (payload.get("text") or "").strip()
@@ -1745,11 +1758,12 @@ class MainWindow(QMainWindow):
 
     def _update_client_name(self, idx: int) -> None:
         name = self.config["clients"][idx].get("name", f"Client {idx + 1}")
-        if 1 + idx < len(self.nav_buttons):
-            self.nav_buttons[1 + idx].setText(name)
+        if self.tabs and self.tabs.count() > 1 + idx:
+            self.tabs.setTabText(1 + idx, name)
         state = self.client_states[idx]
         if state.name_label:
             state.name_label.setText(name)
+        self._refresh_tab_titles()
 
     def _update_global_config(self, key: str, value: Any) -> None:
         self.config["global"][key] = value
