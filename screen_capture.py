@@ -10,12 +10,63 @@ import win32gui
 import win32process
 
 try:
+    import win32api
+    import win32con
+except Exception:  # pragma: no cover - optional at runtime
+    win32api = None  # type: ignore
+    win32con = None  # type: ignore
+
+try:
     import dxcam
 except Exception:  # pragma: no cover - optional dependency at runtime
     dxcam = None  # type: ignore
 
 
 Rect = Tuple[int, int, int, int]
+
+
+def _virtual_bounds() -> Optional[Rect]:
+    if win32api is None or win32con is None:
+        return None
+    try:
+        left = int(win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN))
+        top = int(win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN))
+        width = int(win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN))
+        height = int(win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN))
+    except Exception:
+        return None
+    return left, top, left + width, top + height
+
+
+def _resolve_output_region(region: Rect) -> Tuple[Optional[int], Rect, Optional[Rect], Optional[Rect]]:
+    """Resolve dxcam region ensuring compatibility with multi-monitor layouts."""
+
+    bounds = _virtual_bounds()
+    if bounds is None:
+        return None, region, None, None
+    left, top, right, bottom = bounds
+    shift_x = -left
+    shift_y = -top
+    x1 = int(region[0] + shift_x)
+    y1 = int(region[1] + shift_y)
+    x2 = int(region[2] + shift_x)
+    y2 = int(region[3] + shift_y)
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    inside = 0 <= x1 < width and 0 <= y1 < height and 0 < x2 <= width and 0 < y2 <= height
+    needs_union = (region[0] < 0 or region[1] < 0) or not inside
+    if needs_union:
+        capture_region: Rect = (0, 0, width, height)
+        crop_rect = (
+            max(0, min(width, x1)),
+            max(0, min(height, y1)),
+            max(0, min(width, x2)),
+            max(0, min(height, y2)),
+        )
+    else:
+        capture_region = (x1, y1, x2, y2)
+        crop_rect = None
+    return None, capture_region, crop_rect, bounds
 
 
 def find_pid_by_name(substr: str) -> Optional[int]:
@@ -65,20 +116,45 @@ class DXCapture:
         self.target_fps = target_fps
         self._cam = None
         self._lock = threading.Lock()
+        self._output_idx: Optional[int] = None
+        self._crop_rect: Optional[Rect] = None
+        self._monitor_bounds: Optional[Rect] = None
 
     def start(self) -> None:
         if dxcam is None:
             raise RuntimeError("dxcam bulunamadı. requirements.txt kurulumunu tamamlayın.")
         with self._lock:
             if self._cam is None:
-                self._cam = dxcam.create(output_color="BGR", max_buffer_len=2)
-                self._cam.start(region=self.region, target_fps=self.target_fps)
+                capture_region = self.region
+                if self.prefer_dx:
+                    self._output_idx, capture_region, self._crop_rect, self._monitor_bounds = _resolve_output_region(
+                        self.region
+                    )
+                create_kwargs = {"output_color": "BGR", "max_buffer_len": 2}
+                if self._output_idx is not None:
+                    create_kwargs["output_idx"] = self._output_idx
+                self._cam = dxcam.create(**create_kwargs)
+                self._cam.start(region=capture_region, target_fps=self.target_fps)
 
     def get_latest_frame(self) -> Optional[np.ndarray]:
         with self._lock:
             if self._cam is None:
                 return None
-            return self._cam.get_latest_frame()
+            frame = self._cam.get_latest_frame()
+            if frame is None:
+                return None
+            crop = self._crop_rect
+            if crop is not None:
+                x1, y1, x2, y2 = crop
+                h, w = frame.shape[:2]
+                x1c = max(0, min(w, x1))
+                y1c = max(0, min(h, y1))
+                x2c = max(0, min(w, x2))
+                y2c = max(0, min(h, y2))
+                if x2c <= x1c or y2c <= y1c:
+                    return frame
+                frame = frame[y1c:y2c, x1c:x2c]
+            return frame
 
     def stop(self) -> None:
         with self._lock:

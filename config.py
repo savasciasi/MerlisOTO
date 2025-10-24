@@ -35,8 +35,10 @@ DEFAULT_CLIENT: Dict[str, Any] = {
     "dx_prefer": True,
     "yellow_detect_enabled": True,
     "yellow_min_area": 1200,
+    "yellow_min_height": 36,
     "yellow_padding": 60,
     "yellow_dedupe_window": 12.0,
+    "yellow_fill_ratio": 0.3,
 }
 
 DEFAULT_GLOBAL: Dict[str, Any] = {

@@ -251,7 +251,14 @@ class CaptureWorker(QThread):
             pass
         elif key == "reply_offset_x" or key == "reply_offset_y":
             self.client_config[key] = int(value)
-        elif key in {"icon_thr", "btn_thr", "preview_scale", "dedupe_window", "yellow_dedupe_window"}:
+        elif key in {
+            "icon_thr",
+            "btn_thr",
+            "preview_scale",
+            "dedupe_window",
+            "yellow_dedupe_window",
+            "yellow_fill_ratio",
+        }:
             self.client_config[key] = float(value)
         elif key in {
             "ocr_every",
@@ -261,6 +268,7 @@ class CaptureWorker(QThread):
             "pm_roi_width",
             "pm_roi_height",
             "yellow_min_area",
+            "yellow_min_height",
             "yellow_padding",
         }:
             self.client_config[key] = int(value)
@@ -415,15 +423,17 @@ class CaptureWorker(QThread):
         if not self.client_config.get("yellow_detect_enabled", True):
             return []
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        lower = np.array([18, 80, 80], dtype=np.uint8)
+        lower = np.array([18, 100, 110], dtype=np.uint8)
         upper = np.array([36, 255, 255], dtype=np.uint8)
         mask = cv2.inRange(hsv, lower, upper)
-        mask = cv2.medianBlur(mask, 5)
+        mask = cv2.GaussianBlur(mask, (5, 5), 0)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         min_area = float(self.client_config.get("yellow_min_area", 1200))
+        min_height = int(self.client_config.get("yellow_min_height", 36))
         padding = int(self.client_config.get("yellow_padding", 60))
         dedupe_window = float(self.client_config.get("yellow_dedupe_window", 12.0))
+        fill_ratio_thr = float(self.client_config.get("yellow_fill_ratio", 0.3))
         now = time.time()
         events: List[Dict[str, Any]] = []
         full_frame: Optional[np.ndarray] = None
@@ -436,6 +446,13 @@ class CaptureWorker(QThread):
                 continue
             aspect = w / max(h, 1)
             if aspect < 0.3 or aspect > 3.5:
+                continue
+            if h < max(12, min_height):
+                continue
+            roi_mask = mask[y : y + h, x : x + w]
+            roi_area = max(float(w * h), 1.0)
+            fill_ratio = float(cv2.countNonZero(roi_mask)) / roi_area
+            if fill_ratio < max(0.05, fill_ratio_thr):
                 continue
             x1 = max(0, x - padding)
             y1 = max(0, y - padding)
@@ -1411,6 +1428,14 @@ class MainWindow(QMainWindow):
         yellow_area.valueChanged.connect(lambda value, i=idx: self._update_client_config(i, "yellow_min_area", int(value)))
         yellow_form.addRow("Minimum alan", yellow_area)
 
+        yellow_height = QSpinBox()
+        yellow_height.setRange(10, 400)
+        yellow_height.setValue(int(client_cfg.get("yellow_min_height", 36)))
+        yellow_height.valueChanged.connect(
+            lambda value, i=idx: self._update_client_config(i, "yellow_min_height", int(value))
+        )
+        yellow_form.addRow("Minimum yükseklik", yellow_height)
+
         yellow_padding = QSpinBox()
         yellow_padding.setRange(0, 400)
         yellow_padding.setValue(int(client_cfg.get("yellow_padding", 60)))
@@ -1426,6 +1451,16 @@ class MainWindow(QMainWindow):
             lambda value, i=idx: self._update_client_config(i, "yellow_dedupe_window", float(value))
         )
         yellow_form.addRow("Dedupe (sn)", yellow_dedupe)
+
+        yellow_fill = QDoubleSpinBox()
+        yellow_fill.setRange(0.05, 1.0)
+        yellow_fill.setDecimals(2)
+        yellow_fill.setSingleStep(0.05)
+        yellow_fill.setValue(float(client_cfg.get("yellow_fill_ratio", 0.3)))
+        yellow_fill.valueChanged.connect(
+            lambda value, i=idx: self._update_client_config(i, "yellow_fill_ratio", float(value))
+        )
+        yellow_form.addRow("Doldurma oranı", yellow_fill)
         form_layout.addWidget(yellow_box)
 
         automation_box = QGroupBox("Otomasyon")
