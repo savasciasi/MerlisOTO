@@ -51,11 +51,11 @@ from telegram_client import TelegramClient, TelegramCredentials
 
 
 class DetectionWorker(QThread):
-    frameReady = pyqtSignal(QPixmap, list)
+    frameReady = pyqtSignal(object, list)  # QImage, detections
     statsUpdated = pyqtSignal(float, str)
     logMessage = pyqtSignal(str, str)
     detectionsUpdated = pyqtSignal(list)
-    pmPreviewReady = pyqtSignal(QPixmap)
+    pmPreviewReady = pyqtSignal(object)  # QImage
 
     def __init__(
         self,
@@ -73,12 +73,6 @@ class DetectionWorker(QThread):
             version=app_state.roboflow.version,
         )
         self._telegram_client: Optional[TelegramClient] = None
-        if app_state.telegram.auto_send and app_state.telegram.bot_token:
-            credentials = TelegramCredentials(
-                bot_token=app_state.telegram.bot_token,
-                chat_id=app_state.telegram.chat_id,
-            )
-            self._telegram_client = TelegramClient(credentials)
         self._last_event = "Hazır"
         self._fps_counter = SlidingWindowFPS()
 
@@ -136,12 +130,14 @@ class DetectionWorker(QThread):
             filtered = [d for d in filtered if d.label == PLAYER_LABEL]
 
         annotated = draw_detections(frame, filtered)
-        fps = self._fps_counter.update()
-        self.frameReady.emit(QPixmap.fromImage(convert_frame_to_qimage(annotated)), filtered)
-        self.statsUpdated.emit(fps, self._last_event)
         if filtered:
             self._last_event = f"{len(filtered)} tespit bulundu"
             self.detectionsUpdated.emit(filtered)
+
+        fps = self._fps_counter.update()
+        qimage = convert_frame_to_qimage(annotated)
+        self.frameReady.emit(qimage, filtered)
+        self.statsUpdated.emit(fps, self._last_event)
 
         if self._state.detection.enable_pm_box:
             padding = max(self._state.telegram.padding, 0)
@@ -149,15 +145,22 @@ class DetectionWorker(QThread):
                 if det.label != PM_BOX_LABEL:
                     continue
                 cropped = crop_with_padding(frame, det, padding)
-                pixmap = QPixmap.fromImage(convert_frame_to_qimage(cropped))
-                self.pmPreviewReady.emit(pixmap)
-                if self._state.telegram.auto_send and self._telegram_client:
-                    try:
-                        self._telegram_client.send_image(cropped, caption="Yeni PM tespiti")
-                        self._last_event = "PM kutusu gönderildi"
-                        self.logMessage.emit("INFO", "PM kutusu Telegram'a gönderildi.")
-                    except Exception as exc:
-                        self.logMessage.emit("ERROR", f"Telegram hatası: {exc}")
+                preview = convert_frame_to_qimage(cropped)
+                self.pmPreviewReady.emit(preview)
+                if self._state.telegram.auto_send:
+                    if self._telegram_client is None and self._state.telegram.bot_token:
+                        credentials = TelegramCredentials(
+                            bot_token=self._state.telegram.bot_token,
+                            chat_id=self._state.telegram.chat_id,
+                        )
+                        self._telegram_client = TelegramClient(credentials)
+                    if self._telegram_client:
+                        try:
+                            self._telegram_client.send_image(cropped, caption="Yeni PM tespiti")
+                            self._last_event = "PM kutusu gönderildi"
+                            self.logMessage.emit("INFO", "PM kutusu Telegram'a gönderildi.")
+                        except Exception as exc:
+                            self.logMessage.emit("ERROR", f"Telegram hatası: {exc}")
                 break
 
 
@@ -496,7 +499,8 @@ class MainWindow(QMainWindow):
         self.config.save()
         super().closeEvent(event)
 
-    def _update_preview(self, pixmap: QPixmap, detections: list) -> None:
+    def _update_preview(self, image, detections: list) -> None:
+        pixmap = QPixmap.fromImage(image)
         self.preview_label.setPixmap(pixmap.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def _update_stats(self, fps: float, last_event: str) -> None:
@@ -514,7 +518,8 @@ class MainWindow(QMainWindow):
         for item in reversed(self.player_detections):
             self.last_detections_list.addItem(QListWidgetItem(item))
 
-    def _handle_pm_preview(self, pixmap: QPixmap) -> None:
+    def _handle_pm_preview(self, image) -> None:
+        pixmap = QPixmap.fromImage(image)
         self.pm_previews.append(pixmap)
         self.pm_previews = self.pm_previews[-3:]
         for index in range(3):

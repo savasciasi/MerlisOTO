@@ -5,6 +5,8 @@ import io
 from dataclasses import dataclass
 from typing import Optional
 
+import cv2
+import numpy as np
 from PIL import Image
 
 try:
@@ -52,8 +54,14 @@ class TelegramClient:
             raise RuntimeError("Telegram chat ID boş olamaz.")
         if isinstance(image, Image.Image):
             pil_image = image
+        elif isinstance(image, np.ndarray):
+            if image.ndim == 3 and image.shape[2] == 3:
+                rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            else:
+                rgb = image
+            pil_image = Image.fromarray(rgb)
         else:
-            pil_image = Image.fromarray(image)
+            raise RuntimeError("Desteklenmeyen görüntü formatı")
         bio = io.BytesIO()
         pil_image.save(bio, format="PNG")
         bio.seek(0)
