@@ -26,6 +26,7 @@ pip install -r requirements.txt
 > - RapidOCR için `rapidocr-onnxruntime` paketi ONNXRuntime CPU çekirdeğini kullanır. NVIDIA GPU'nuz varsa `onnxruntime-gpu` paketini ayrıca yükleyebilirsiniz.
 > - `dxcam`, `pywin32` ve `psutil` yalnızca Windows üzerinde çalışır.
 > - `assets/` klasöründe `pm_icon.png`, `pm_close_x.png`, `pm_send_btn.png` dosyalarının bulunduğundan emin olun.
+> - RapidOCR yüklenemezse uygulama OCR'i devre dışı bırakıp log panelinde ayrıntılı bir hata mesajı gösterir. Bu durumda `onnxruntime` kurulumunuzu ve gerekli Visual C++ paketlerini gözden geçirin.
 
 ## Kullanım
 

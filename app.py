@@ -36,7 +36,7 @@ from PyQt5.QtWidgets import (
 )
 
 from config import ensure_directories, load_config, save_config
-from ocr_engine import OCREngine
+from ocr_engine import OCREngine, OCREngineError
 from screen_capture import DXCapture, find_pid_by_name, get_window_rect_by_pid
 from templates import match_template
 from telegram_client import TelegramClient
@@ -63,7 +63,14 @@ class CaptureWorker(QThread):
         self.config = config
         self._stop_event = threading.Event()
         self._capture: Optional[DXCapture] = None
-        self._ocr_engine = OCREngine(use_gpu=config.get("ocr_use_gpu", True))
+        self._ocr_engine: Optional[OCREngine] = None
+        self._ocr_error_reported = False
+        self.initialization_error: Optional[str] = None
+        try:
+            self._ocr_engine = OCREngine(use_gpu=config.get("ocr_use_gpu", True))
+        except OCREngineError as exc:
+            self.initialization_error = str(exc)
+            self._ocr_engine = None
         self._telegram = TelegramClient(
             token=config.get("telegram_token", ""),
             chat_id=config.get("telegram_chat_id", ""),
@@ -215,7 +222,18 @@ class CaptureWorker(QThread):
             checksum = hashlib.md5(roi.tobytes()).hexdigest()
             if checksum == self._last_checksum:
                 return None
-        text = self._ocr_engine.read(roi)
+        if self._ocr_engine is None:
+            if self.initialization_error and not self._ocr_error_reported:
+                self.logMessage.emit("ERROR", self.initialization_error)
+                self._ocr_error_reported = True
+            return None
+        try:
+            text = self._ocr_engine.read(roi)
+        except OCREngineError as exc:
+            if not self._ocr_error_reported:
+                self.logMessage.emit("ERROR", str(exc))
+                self._ocr_error_reported = True
+            return None
         if not text or len(text.strip()) < int(self.config.get("new_msg_min_len", 2)):
             return None
         now = datetime.utcnow()
@@ -505,12 +523,22 @@ class MainWindow(QMainWindow):
         if self.capture_thread and self.capture_thread.isRunning():
             QMessageBox.information(self, "Bilgi", "Yakalama zaten çalışıyor.")
             return
-        self.capture_thread = CaptureWorker(dict(self.config))
+        worker = CaptureWorker(dict(self.config))
+        self.capture_thread = worker
         self.capture_thread.frameReady.connect(self.on_frame_ready)
         self.capture_thread.logMessage.connect(self.log)
         self.capture_thread.statusUpdated.connect(self.update_status)
         self.capture_thread.pmPreviewReady.connect(self.on_pm_preview)
         self.capture_thread.frameForSave.connect(self._on_frame_for_save)
+        if worker.initialization_error:
+            self.log("ERROR", worker.initialization_error)
+            QMessageBox.warning(
+                self,
+                "OCR Başlatılamadı",
+                "RapidOCR/ONNXRuntime doğru yüklenmediği için OCR devre dışı bırakıldı.\n"
+                "Kurulumu kontrol edip uygulamayı yeniden başlatın.",
+            )
+            worker._ocr_error_reported = True
         self.capture_thread.start()
         self.update_status("Başlatılıyor")
 
