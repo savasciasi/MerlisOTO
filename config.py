@@ -1,109 +1,64 @@
-"""Configuration helpers for Merlis Metin2 Bot GUI."""
+"""Configuration utilities for Merlis PM OCR bot."""
 from __future__ import annotations
 
 import json
-import threading
-from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
-CONFIG_FILE = Path("config.json")
+CONFIG_PATH = Path("config.json")
 
-
-def _ensure_parent(path: Path) -> None:
-    if not path.parent.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-
-@dataclass
-class TelegramSettings:
-    bot_token: str = "PASTE_BOT_TOKEN"
-    chat_id: str = "PASTE_CHAT_ID"
-    auto_send: bool = False
-    padding: int = 20
-
-
-@dataclass
-class OCRSettings:
-    language: str = "tur+eng"
-    oem: int = 3
-    psm: int = 6
-    confidence: float = 0.7
-    min_text_length: int = 3
-    custom_config: str = ""
-    player_keywords: List[str] = field(
-        default_factory=lambda: ["player", "oyuncu", "lv", "guild", "hp"]
-    )
-    pm_keywords: List[str] = field(
-        default_factory=lambda: ["pm", "fısıltı", "whisper", "mesaj"]
-    )
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "pid": 0,
+    "process_hint": "merlis",
+    "preview_scale": 0.75,
+    "roi_top": 0,
+    "roi_left": 0,
+    "roi_width": 0,
+    "roi_height": 0,
+    "use_roi_override": False,
+    "ocr_every": 6,
+    "checksum_enabled": True,
+    "icon_thr": 0.80,
+    "btn_thr": 0.80,
+    "pm_roi_offset_x": 0,
+    "pm_roi_offset_y": 40,
+    "pm_roi_width": 420,
+    "pm_roi_height": 180,
+    "auto_send": True,
+    "dedupe_window": 8.0,
+    "new_msg_min_len": 2,
+    "dx_prefer": True,
+    "ocr_use_gpu": True,
+    "telegram_token": "",
+    "telegram_chat_id": "",
+}
 
 
-@dataclass
-class DetectionSettings:
-    monitor_index: int = 0
-    enable_pm_box: bool = True
-    save_overlay_dir: str = "captures"
-    show_only_player: bool = False
+def ensure_directories() -> None:
+    """Create required directories for assets and captures."""
+    Path("captures").mkdir(parents=True, exist_ok=True)
+    Path("assets").mkdir(exist_ok=True)
 
 
-@dataclass
-class AppState:
-    telegram: TelegramSettings = field(default_factory=TelegramSettings)
-    ocr: OCRSettings = field(default_factory=OCRSettings)
-    detection: DetectionSettings = field(default_factory=DetectionSettings)
-    theme: str = "dark"
-
-
-class ConfigManager:
-    """Thread-safe configuration loader/saver."""
-
-    def __init__(self, path: Path = CONFIG_FILE) -> None:
-        self._path = path
-        self._lock = threading.Lock()
-        self.state = AppState()
-        self.load()
-
-    def load(self) -> None:
-        """Load configuration from disk if present."""
-        if not self._path.exists():
-            return
+def load_config() -> Dict[str, Any]:
+    """Load configuration from disk, falling back to defaults."""
+    ensure_directories()
+    if CONFIG_PATH.exists():
         try:
-            with self._path.open("r", encoding="utf-8") as fh:
-                raw: Dict[str, Any] = json.load(fh)
-            self._update_state(raw)
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            merged = {**DEFAULT_CONFIG, **data}
+            save_config(merged)
+            return merged
         except Exception:
-            # keep defaults; caller will log
-            return
-
-    def _update_state(self, raw: Dict[str, Any]) -> None:
-        telegram = raw.get("telegram", {})
-        ocr = raw.get("ocr", {})
-        detection = raw.get("detection", {})
-        self.state.telegram = TelegramSettings(**{**asdict(TelegramSettings()), **telegram})
-        self.state.ocr = OCRSettings(**{**asdict(OCRSettings()), **ocr})
-        self.state.detection = DetectionSettings(**{**asdict(DetectionSettings()), **detection})
-        self.state.theme = raw.get("theme", "dark")
-
-    def save(self) -> None:
-        """Persist configuration to disk."""
-        data = asdict(self.state)
-        with self._lock:
-            _ensure_parent(self._path)
-            with self._path.open("w", encoding="utf-8") as fh:
-                json.dump(data, fh, ensure_ascii=False, indent=2)
-
-    def update(self, **kwargs: Any) -> None:
-        """Update top-level values and persist."""
-        for key, value in kwargs.items():
-            if hasattr(self.state, key):
-                setattr(self.state, key, value)
-        self.save()
+            # Fall back to defaults on malformed configuration files
+            pass
+    save_config(DEFAULT_CONFIG)
+    return dict(DEFAULT_CONFIG)
 
 
-def ensure_directories(config: AppState) -> None:
-    """Create directories needed by the application."""
-    capture_dir = Path(config.detection.save_overlay_dir)
-    capture_dir.mkdir(parents=True, exist_ok=True)
-    docs_dir = Path("docs")
-    docs_dir.mkdir(exist_ok=True)
+def save_config(config: Dict[str, Any]) -> None:
+    """Persist configuration to disk."""
+    ensure_directories()
+    CONFIG_PATH.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
+    )

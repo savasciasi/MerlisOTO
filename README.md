@@ -1,31 +1,31 @@
-# Merlis Metin2 Bot Kontrol Paneli
+# Merlis Metin2 PM OCR Botu
 
-Modern PyQt5 arayüzü ile Metin2 ekran görüntüsü üzerinden Tesseract OCR tespiti yapan bu proje, oyuncu (`player`) ve özel mesaj kutusu (`pm-box`) ifadelerini gerçek zamanlı izlemenizi sağlar. Uygulama, tespit edilen PM kutularını isteğe bağlı olarak Telegram'a iletebilir, ekran görüntülerini kaydedebilir ve test modu ile kayıtlı görüntü/video üzerinde çalışabilir.
+Windows üzerinde çalışan bu proje, Merlis oyun penceresini DXCam ile 60 FPS'e kadar yakalayarak RapidOCR (ONNXRuntime) ile özel mesaj (PM) panelindeki yeni mesajları tespit eder. PyQt5 ile hazırlanmış koyu temalı kontrol paneli üzerinden tüm ayarları yönetebilir, yeni PM'leri Telegram'a otomatik iletebilir ve overlay'li ekran görüntüleri kaydedebilirsiniz.
 
 ## Özellikler
 
-- PyQt5 tabanlı koyu temalı kontrol paneli
-- MSS ile gerçek zamanlı ekran yakalama
-- Tesseract OCR ile anahtar kelime tabanlı `player` ve `pm-box` eşleşmeleri
-- Canlı önizlemede tespit kutuları ve etiketleri
-- FPS, son olay ve zaman damgalı log takibi
-- Son 10 oyuncu eşleşmesinin listelenmesi
-- PM kutusu eşleşmesi, Telegram otomatik gönderimi ve kırpma padding ayarları
-- OCR ve Telegram bilgilerinin GUI üzerinden değiştirilmesi
-- Test modu ile görüntü veya video dosyası üzerinden simülasyon
-- Overlay içeren ekran görüntülerini `captures/` klasörüne kaydetme
-- Ayarların `config.json` dosyasında saklanması
-- PyInstaller ile tek dosya haline getirme desteği
+- DXCam tabanlı pencere yakalama, Merlis sürecine PID ile kilitlenme
+- PM panelini ikon temelli template matching ile bulma
+- RapidOCR + ONNXRuntime ile hızlı OCR ve checksum bazlı değişim takibi
+- 60 FPS canlı önizleme (ölçeklenebilir), 8–12 FPS OCR döngüsü
+- Yeni PM bulunduğunda Telegram'a metin ve ekran kırpıntısı gönderimi
+- Tüm eşi̇kler, ROI ve OCR parametreleri GUI üzerinden ayarlanabilir
+- Ayarlar `config.json` dosyasında kalıcı olarak saklanır
+- Overlay'li ekran görüntüsünü `captures/` klasörüne kaydetme
+- Zaman damgalı log paneli, son tespit edilen mesaj listesi
 
 ## Kurulum
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+. .venv/Scripts/activate  # PowerShell: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-> Not: Tesseract OCR motorunun sisteminizde kurulu olması gerekir. Windows için [Tesseract kurulumu](https://github.com/UB-Mannheim/tesseract/wiki) sayfasından indirip PATH değişkenine ekleyebilirsiniz.
+> Notlar:
+> - RapidOCR için `rapidocr-onnxruntime` paketi ONNXRuntime CPU çekirdeğini kullanır. NVIDIA GPU'nuz varsa `onnxruntime-gpu` paketini ayrıca yükleyebilirsiniz.
+> - `dxcam`, `pywin32` ve `psutil` yalnızca Windows üzerinde çalışır.
+> - `assets/` klasöründe `pm_icon.png`, `pm_close_x.png`, `pm_send_btn.png` dosyalarının bulunduğundan emin olun.
 
 ## Kullanım
 
@@ -33,21 +33,18 @@ pip install -r requirements.txt
 python app.py
 ```
 
-İlk açılışta OCR ve Telegram ayarlarını girerek kaydedebilirsiniz. Ayarlar uygulama kapandığında `config.json` dosyasına yazılır.
+1. **Pencere / PID** sekmesinden Merlis sürecini otomatik bulabilir ya da PID değerini girebilirsiniz.
+2. Gerekirse ROI override alanlarını kullanarak manuel bir yakalama bölgesi tanımlayın.
+3. **Telegram** sekmesinden bot token ve chat ID bilgilerinizi girerek otomatik gönderimi etkinleştirin.
+4. Dashboard üzerinden "Başlat" düğmesine basarak canlı yakalamayı başlatın. Son PM'ler listede görüntülenir.
+5. "Ekran Görüntüsü Kaydet" düğmesi o anki overlay'li kareyi `captures/` klasörüne kaydeder.
 
-### Test Modu
+## Paketleme
 
-- `OCR Ayarları` sekmesindeki **Tek Kare OCR Testi** butonu ile bir görüntü veya video dosyası seçerek tespiti simüle edebilirsiniz.
-- Video seçilmesi durumunda OCR işlemleri ayrı bir iş parçacığında oynatılır.
-
-### Ekran Görüntüsü
-
-- `Oyuncu Tanıma` sekmesindeki **Ekran Görüntüsü Kaydet** butonu ile overlay içeren kareler `captures/` klasörüne kaydedilir.
-
-## PyInstaller ile Paketleme
+PyInstaller ile GUI'yi tek yürütülebilir dosya haline getirebilirsiniz:
 
 ```bash
-pyinstaller --noconsole --name "MerlisMetin2Bot" app.py --add-data "assets;assets"
+pyinstaller --noconsole --name "MerlisPMBot" app.py --add-data "assets;assets"
 ```
 
-Oluşturulan `dist/MerlisMetin2Bot.exe` dosyası uygulamayı Windows üzerinde tek başına çalıştırır.
+Ortaya çıkan `dist/MerlisPMBot.exe` dosyası tek başına çalıştırılabilir.

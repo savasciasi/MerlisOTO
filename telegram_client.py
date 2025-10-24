@@ -1,72 +1,56 @@
-"""Telegram client wrapper using python-telegram-bot 13.15."""
+"""Minimal Telegram client using the Bot API."""
 from __future__ import annotations
 
-import io
-from dataclasses import dataclass
-from typing import Optional
-
 import cv2
-import numpy as np
+import io
+from typing import Any, Optional
+
+import requests
 from PIL import Image
-
-try:
-    from telegram import Bot
-    from telegram.error import TelegramError
-except Exception:  # pragma: no cover - during tests
-    Bot = None  # type: ignore
-    TelegramError = Exception  # type: ignore
-
-
-@dataclass
-class TelegramCredentials:
-    bot_token: str
-    chat_id: str
 
 
 class TelegramClient:
-    def __init__(self, credentials: TelegramCredentials) -> None:
-        self.credentials = credentials
-        self._bot: Optional[Bot] = None
+    """HTTP based Telegram sender for PM notifications."""
 
-    def ensure_bot(self) -> None:
-        if self._bot is not None:
-            return
-        if not self.credentials.bot_token:
-            raise RuntimeError("Telegram bot token boş olamaz.")
-        if Bot is None:
-            raise RuntimeError("python-telegram-bot paketi bulunamadı.")
-        self._bot = Bot(self.credentials.bot_token)
+    def __init__(self, token: str = "", chat_id: str = "") -> None:
+        self.token = token or ""
+        self.chat_id = chat_id or ""
 
-    def send_message(self, text: str) -> None:
-        self.ensure_bot()
-        if not self.credentials.chat_id:
-            raise RuntimeError("Telegram chat ID boş olamaz.")
-        try:
-            assert self._bot is not None
-            self._bot.send_message(chat_id=self.credentials.chat_id, text=text)
-        except TelegramError as exc:
-            raise RuntimeError(str(exc)) from exc
+    @property
+    def base_url(self) -> str:
+        return f"https://api.telegram.org/bot{self.token}" if self.token else ""
 
-    def send_image(self, image, caption: str = "") -> None:
-        """Send an OpenCV image or PIL image to Telegram."""
-        self.ensure_bot()
-        if not self.credentials.chat_id:
-            raise RuntimeError("Telegram chat ID boş olamaz.")
-        if isinstance(image, Image.Image):
-            pil_image = image
-        elif isinstance(image, np.ndarray):
-            if image.ndim == 3 and image.shape[2] == 3:
-                rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            else:
-                rgb = image
-            pil_image = Image.fromarray(rgb)
-        else:
-            raise RuntimeError("Desteklenmeyen görüntü formatı")
-        bio = io.BytesIO()
-        pil_image.save(bio, format="PNG")
-        bio.seek(0)
-        try:
-            assert self._bot is not None
-            self._bot.send_photo(chat_id=self.credentials.chat_id, photo=bio, caption=caption)
-        except TelegramError as exc:
-            raise RuntimeError(str(exc)) from exc
+    def configure(self, token: str, chat_id: str) -> None:
+        self.token = token or ""
+        self.chat_id = chat_id or ""
+
+    def ready(self) -> bool:
+        return bool(self.token and self.chat_id)
+
+    def send_text(self, text: str) -> Optional[Any]:
+        if not self.ready():
+            return None
+        resp = requests.post(
+            f"{self.base_url}/sendMessage",
+            data={"chat_id": self.chat_id, "text": text},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def send_photo(self, bgr_image, caption: str = "PM") -> Optional[Any]:
+        if not self.ready():
+            return None
+        rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+        buffer = io.BytesIO()
+        Image.fromarray(rgb).save(buffer, format="PNG")
+        buffer.seek(0)
+        files = {"photo": ("pm.png", buffer.getvalue(), "image/png")}
+        resp = requests.post(
+            f"{self.base_url}/sendPhoto",
+            data={"chat_id": self.chat_id, "caption": caption},
+            files=files,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()

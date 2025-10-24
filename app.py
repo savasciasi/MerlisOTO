@@ -1,732 +1,596 @@
-"""PyQt5 GUI entry point for the Merlis Metin2 Bot Control Panel."""
+"""PyQt5 GUI for the Merlis PM OCR bot."""
 from __future__ import annotations
 
+import hashlib
 import sys
-import time
 import threading
-from datetime import datetime
+import time
+from collections import deque
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
-from mss import mss
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QKeySequence, QPixmap
+from PyQt5.QtGui import QImage, QPalette, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
-    QFileDialog,
+    QComboBox,
+    QDoubleSpinBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QSlider,
     QSpinBox,
-    QStackedWidget,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
-    QShortcut,
 )
 
-from config import AppState, ConfigManager, ensure_directories
-from detector import (
-    PLAYER_LABEL,
-    PM_BOX_LABEL,
-    Detection,
-    SlidingWindowFPS,
-    TesseractDetector,
-    convert_frame_to_qimage,
-    crop_with_padding,
-    draw_detections,
-)
-from telegram_client import TelegramClient, TelegramCredentials
+from config import ensure_directories, load_config, save_config
+from ocr_engine import OCREngine
+from screen_capture import DXCapture, find_pid_by_name, get_window_rect_by_pid
+from templates import match_template
+from telegram_client import TelegramClient
+
+ASSET_ICON = Path("assets/pm_icon.png")
+CAPTURE_DIR = Path("captures")
 
 
-class DetectionWorker(QThread):
-    frameReady = pyqtSignal(object, list)  # QImage, detections
-    statsUpdated = pyqtSignal(float, str)
+def numpy_to_qimage(frame: np.ndarray) -> QImage:
+    height, width, channel = frame.shape
+    bytes_per_line = channel * width
+    return QImage(frame.data, width, height, bytes_per_line, QImage.Format_BGR888).copy()
+
+
+class CaptureWorker(QThread):
+    frameReady = pyqtSignal(object, float)  # QImage, FPS
     logMessage = pyqtSignal(str, str)
-    detectionsUpdated = pyqtSignal(list)
-    pmPreviewReady = pyqtSignal(object)  # QImage
+    statusUpdated = pyqtSignal(str)
+    pmPreviewReady = pyqtSignal(object, str)  # QImage, text
+    frameForSave = pyqtSignal(object)  # np.ndarray overlay frame
 
-    def __init__(
-        self,
-        app_state: AppState,
-        video_source: Optional[str] = None,
-    ) -> None:
+    def __init__(self, config: Dict[str, Any]) -> None:
         super().__init__()
-        self._state = app_state
-        self._video_source = video_source
+        self.config = config
         self._stop_event = threading.Event()
-        self._detector = TesseractDetector(
-            language=app_state.ocr.language,
-            oem=app_state.ocr.oem,
-            psm=app_state.ocr.psm,
-            custom_config=app_state.ocr.custom_config,
+        self._capture: Optional[DXCapture] = None
+        self._ocr_engine = OCREngine(use_gpu=config.get("ocr_use_gpu", True))
+        self._telegram = TelegramClient(
+            token=config.get("telegram_token", ""),
+            chat_id=config.get("telegram_chat_id", ""),
         )
-        self._telegram_client: Optional[TelegramClient] = None
-        self._last_event = "Hazır"
-        self._fps_counter = SlidingWindowFPS()
-        self._last_detection_error: Optional[str] = None
-        self._last_telegram_error: Optional[str] = None
+        self._pm_icon = cv2.imread(str(ASSET_ICON), cv2.IMREAD_GRAYSCALE)
+        self._last_checksum: Optional[str] = None
+        self._last_text: Optional[str] = None
+        self._last_text_time: Optional[datetime] = None
+        self._frame_counter = 0
+        self._fps_window: deque[float] = deque(maxlen=120)
 
     def stop(self) -> None:
         self._stop_event.set()
 
+    def _resolve_region(self) -> Optional[Tuple[int, int, int, int]]:
+        if self.config.get("use_roi_override"):
+            left = int(self.config.get("roi_left", 0))
+            top = int(self.config.get("roi_top", 0))
+            width = int(self.config.get("roi_width", 0))
+            height = int(self.config.get("roi_height", 0))
+            if width > 0 and height > 0:
+                return (left, top, left + width, top + height)
+        pid = int(self.config.get("pid") or 0)
+        if pid <= 0:
+            return None
+        rect = get_window_rect_by_pid(pid)
+        return rect
+
     def run(self) -> None:  # noqa: D401
-        if self._video_source:
-            self._run_video()
-        else:
-            self._run_live()
-
-    def _run_video(self) -> None:
-        cap = cv2.VideoCapture(self._video_source)
-        if not cap.isOpened():
-            self.logMessage.emit("ERROR", "Video dosyası açılamadı.")
+        region = self._resolve_region()
+        if region is None:
+            self.logMessage.emit("ERROR", "Geçerli pencere bölgesi bulunamadı. PID/ROI ayarlarını kontrol edin.")
             return
-        while not self._stop_event.is_set():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            self._process_frame(frame)
-            time.sleep(0.03)
-        cap.release()
-
-    def _run_live(self) -> None:
-        with mss() as screen:
-            monitors = screen.monitors
-            index = min(max(self._state.detection.monitor_index, 0), len(monitors) - 1)
-            monitor = monitors[index]
-            while not self._stop_event.is_set():
-                sct_img = screen.grab(monitor)
-                frame = np.array(sct_img)
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                self._process_frame(frame)
-
-    def _process_frame(self, frame: np.ndarray) -> None:
         try:
-            self._detector.configure(
-                language=self._state.ocr.language,
-                oem=self._state.ocr.oem,
-                psm=self._state.ocr.psm,
-                custom_config=self._state.ocr.custom_config,
-            )
-            detections = self._detector.predict(
-                frame,
-                confidence=self._state.ocr.confidence,
-                min_text_length=self._state.ocr.min_text_length,
-                player_keywords=self._state.ocr.player_keywords,
-                pm_keywords=self._state.ocr.pm_keywords,
-                include_pm=self._state.detection.enable_pm_box,
-            )
-        except Exception as exc:
-            self._handle_prediction_failure(frame, str(exc))
+            self._capture = DXCapture(region=region, prefer_dx=self.config.get("dx_prefer", True))
+            self._capture.start()
+        except Exception as exc:  # pragma: no cover - hardware interaction
+            self.logMessage.emit("ERROR", f"dxcam başlatılamadı: {exc}")
             return
-
-        self._clear_prediction_error()
-
-        filtered = [d for d in detections if d.label == PLAYER_LABEL or self._state.detection.enable_pm_box]
-        if self._state.detection.show_only_player:
-            filtered = [d for d in filtered if d.label == PLAYER_LABEL]
-
-        annotated = draw_detections(frame, filtered)
-        if filtered:
-            self._last_event = f"{len(filtered)} OCR eşleşmesi bulundu"
-            self.detectionsUpdated.emit(filtered)
-        else:
-            self._last_event = "Eşleşme bulunamadı"
-
-        fps = self._fps_counter.update()
-        qimage = convert_frame_to_qimage(annotated)
-        self.frameReady.emit(qimage, filtered)
-        self.statsUpdated.emit(fps, self._last_event)
-
-        if self._state.detection.enable_pm_box:
-            padding = max(self._state.telegram.padding, 0)
-            for det in filtered:
-                if det.label != PM_BOX_LABEL:
-                    continue
-                cropped = crop_with_padding(frame, det, padding)
-                preview = convert_frame_to_qimage(cropped)
-                self.pmPreviewReady.emit(preview)
-                if self._state.telegram.auto_send:
-                    if not self._state.telegram.bot_token or not self._state.telegram.chat_id:
-                        self._log_telegram_error("Telegram bot token veya chat ID ayarlanmadı.")
-                    else:
-                        if self._telegram_client is None:
-                            credentials = TelegramCredentials(
-                                bot_token=self._state.telegram.bot_token,
-                                chat_id=self._state.telegram.chat_id,
-                            )
-                            self._telegram_client = TelegramClient(credentials)
-                        if self._telegram_client:
-                            try:
-                                self._telegram_client.send_image(cropped, caption="Yeni PM tespiti")
-                                self._last_event = "PM kutusu gönderildi"
-                                self.logMessage.emit("INFO", "PM kutusu Telegram'a gönderildi.")
-                                self._clear_telegram_error()
-                            except Exception as exc:
-                                self._log_telegram_error(str(exc))
-                                self._telegram_client = None
+        if self._pm_icon is None:
+            self.logMessage.emit("WARN", "assets/pm_icon.png okunamadı. PM tespiti yapılamaz.")
+        self.logMessage.emit("INFO", "Yakalama başlatıldı.")
+        self.statusUpdated.emit("Çalışıyor")
+        last_time = time.perf_counter()
+        while not self._stop_event.is_set():
+            frame = None
+            try:
+                frame = self._capture.get_latest_frame() if self._capture else None
+            except Exception as exc:  # pragma: no cover
+                self.logMessage.emit("ERROR", f"Frame alınamadı: {exc}")
                 break
+            if frame is None:
+                time.sleep(0.005)
+                continue
+            if frame.ndim == 2:
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            self._frame_counter += 1
+            overlay_frame, pm_roi, pm_text = self._process_frame(frame)
 
-    def _handle_prediction_failure(self, frame: np.ndarray, message: str) -> None:
-        formatted = message if message.startswith("OCR") else f"OCR yapılamadı: {message}"
-        if self._last_detection_error != formatted:
-            self.logMessage.emit("ERROR", formatted)
-            self._last_detection_error = formatted
-        self._last_event = "OCR hatası"
-        fps = self._fps_counter.update()
-        qimage = convert_frame_to_qimage(frame)
-        self.frameReady.emit(qimage, [])
-        self.statsUpdated.emit(fps, self._last_event)
-        time.sleep(0.5)
+            now = time.perf_counter()
+            dt = max(now - last_time, 1e-6)
+            last_time = now
+            fps = 1.0 / dt
+            self._fps_window.append(fps)
+            avg_fps = sum(self._fps_window) / len(self._fps_window)
 
-    def _clear_prediction_error(self) -> None:
-        self._last_detection_error = None
+            scaled_frame = overlay_frame
+            scale = float(self.config.get("preview_scale", 0.75) or 1.0)
+            if scale and 0 < scale < 1.5:
+                scaled_frame = cv2.resize(overlay_frame, (0, 0), fx=scale, fy=scale)
+            qimage = numpy_to_qimage(scaled_frame)
+            self.frameReady.emit(qimage, avg_fps)
+            self.frameForSave.emit(overlay_frame.copy())
 
-    def _log_telegram_error(self, message: str) -> None:
-        formatted = f"Telegram mesajı gönderilemedi: {message}"
-        if self._last_telegram_error != formatted:
-            self.logMessage.emit("ERROR", formatted)
-            self._last_telegram_error = formatted
+            if pm_roi is not None and pm_text is not None:
+                self.pmPreviewReady.emit(numpy_to_qimage(pm_roi), pm_text)
+            else:
+                self.statusUpdated.emit("Çalışıyor")
+        self.statusUpdated.emit("Durduruldu")
+        if self._capture:
+            self._capture.stop()
+        self.logMessage.emit("INFO", "Yakalama sonlandırıldı.")
 
-    def _clear_telegram_error(self) -> None:
-        self._last_telegram_error = None
+    def _process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[str]]:
+        display = frame.copy()
+        pm_roi_img = None
+        detected_text = None
+        if self._pm_icon is not None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            matches = match_template(gray, self._pm_icon, float(self.config.get("icon_thr", 0.8)))
+            if matches:
+                x1, y1, x2, y2, score = matches[0]
+                cv2.rectangle(display, (x1, y1), (x2, y2), (0, 200, 255), 2)
+                cv2.putText(
+                    display,
+                    f"icon {score:.2f}",
+                    (x1, max(0, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 200, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                roi_info = self._extract_pm_roi(frame, (x1, y1, x2, y2))
+                if roi_info is not None:
+                    top, left, bottom, right, roi_img = roi_info
+                    pm_roi_img = roi_img
+                    cv2.rectangle(
+                        display,
+                        (left, top),
+                        (right, bottom),
+                        (120, 255, 120),
+                        2,
+                    )
+                    detected_text = self._maybe_run_ocr(frame, (top, left, bottom, right))
+        return display, pm_roi_img, detected_text
 
+    def _extract_pm_roi(
+        self, frame: np.ndarray, icon_box: Tuple[int, int, int, int]
+    ) -> Optional[Tuple[int, int, int, int, np.ndarray]]:
+        x1, y1, x2, y2 = icon_box
+        offset_x = int(self.config.get("pm_roi_offset_x", 0))
+        offset_y = int(self.config.get("pm_roi_offset_y", 40))
+        width = int(self.config.get("pm_roi_width", 420))
+        height = int(self.config.get("pm_roi_height", 180))
+        top = max(0, y2 + offset_y)
+        left = max(0, x1 + offset_x)
+        bottom = min(frame.shape[0], top + height)
+        right = min(frame.shape[1], left + width)
+        if bottom <= top or right <= left:
+            return None
+        return top, left, bottom, right, frame[top:bottom, left:right].copy()
 
-class LogPanel:
-    def __init__(self, widget: QTextEdit) -> None:
-        self.widget = widget
-        self.widget.setReadOnly(True)
+    def _maybe_run_ocr(
+        self, frame: np.ndarray, roi_slice: Tuple[int, int, int, int] | np.ndarray
+    ) -> Optional[str]:
+        if isinstance(roi_slice, np.ndarray):
+            roi = roi_slice
+        else:
+            top, left, bottom, right = roi_slice
+            roi = frame[top:bottom, left:right]
+        every = int(self.config.get("ocr_every", 6))
+        if every <= 0:
+            every = 1
+        if self._frame_counter % every != 0:
+            return None
+        checksum = None
+        if self.config.get("checksum_enabled", True):
+            checksum = hashlib.md5(roi.tobytes()).hexdigest()
+            if checksum == self._last_checksum:
+                return None
+        text = self._ocr_engine.read(roi)
+        if not text or len(text.strip()) < int(self.config.get("new_msg_min_len", 2)):
+            return None
+        now = datetime.utcnow()
+        dedupe_window = float(self.config.get("dedupe_window", 8.0))
+        if self._last_text == text and self._last_text_time:
+            if now - self._last_text_time < timedelta(seconds=dedupe_window):
+                return None
+        self._last_text = text
+        self._last_text_time = now
+        if checksum is not None:
+            self._last_checksum = checksum
+        self.logMessage.emit("INFO", f"Yeni PM: {text}")
+        self._handle_telegram(text, roi)
+        self.statusUpdated.emit("Yeni PM tespit edildi")
+        return text
 
-    def append(self, level: str, message: str) -> None:
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        formatted = f"[{timestamp}] {level}: {message}"
-        self.widget.append(formatted)
+    def _handle_telegram(self, text: str, roi: np.ndarray) -> None:
+        if not self.config.get("auto_send", True):
+            return
+        if not self._telegram.ready():
+            self.logMessage.emit("WARN", "Telegram bilgileri eksik, mesaj gönderilemiyor.")
+            return
+        try:
+            self._telegram.send_text(text)
+            self._telegram.send_photo(roi, caption=text[:120])
+            self.logMessage.emit("INFO", "Telegram'a PM iletildi.")
+        except Exception as exc:  # pragma: no cover
+            self.logMessage.emit("ERROR", f"Telegram gönderimi başarısız: {exc}")
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, config: ConfigManager) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Merlis Metin2 Bot Kontrol Paneli")
-        self.resize(1280, 800)
-        self.config = config
-        self.worker: Optional[DetectionWorker] = None
-        self.player_detections: List[str] = []
-        self.pm_previews: List[QPixmap] = []
-        ensure_directories(config.state)
-
+        ensure_directories()
+        self.config = load_config()
+        self.capture_thread: Optional[CaptureWorker] = None
+        self.latest_overlay: Optional[np.ndarray] = None
+        self.preview_label = QLabel(alignment=Qt.AlignCenter)
+        self.fps_label = QLabel("FPS: 0")
+        self.status_label = QLabel("Durum: Hazır")
+        self.last_messages = QListWidget()
+        self.log_panel = QTextEdit()
+        self.log_panel.setReadOnly(True)
+        self.pm_preview_label = QLabel("PM önizleme yok", alignment=Qt.AlignCenter)
+        self.pm_preview_label.setMinimumHeight(150)
+        self.telegram_client = TelegramClient(
+            token=self.config.get("telegram_token", ""),
+            chat_id=self.config.get("telegram_chat_id", ""),
+        )
         self._build_ui()
-        self._apply_theme()
-        self._connect_signals()
+        self.update_status("Hazır")
 
-    # region UI setup
+    # UI construction -------------------------------------------------
     def _build_ui(self) -> None:
+        self.setWindowTitle("Merlis Metin2 PM OCR Kontrol Paneli")
         central = QWidget()
+        layout = QVBoxLayout(central)
+        tabs = QTabWidget()
+        tabs.addTab(self._build_dashboard_tab(), "Dashboard")
+        tabs.addTab(self._build_pm_tab(), "PM Algılama")
+        tabs.addTab(self._build_window_tab(), "Pencere / PID")
+        tabs.addTab(self._build_telegram_tab(), "Telegram")
+        tabs.addTab(self._build_logs_tab(), "Loglar")
+        layout.addWidget(tabs)
         self.setCentralWidget(central)
-        layout = QHBoxLayout(central)
 
-        self.nav_list = QListWidget()
-        self.nav_list.setFixedWidth(220)
-        self.nav_list.addItems(
-            [
-                "Dashboard",
-                "Oyuncu Tanıma",
-                "PM Mesaj Algılama",
-                "OCR Ayarları",
-                "Telegram",
-                "Loglar",
-            ]
-        )
-        self.nav_list.setCurrentRow(0)
-        layout.addWidget(self.nav_list)
+    def _build_dashboard_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.addWidget(self.preview_label, stretch=1)
 
-        self.stack = QStackedWidget()
-        layout.addWidget(self.stack, 1)
+        info_row = QHBoxLayout()
+        info_row.addWidget(self.fps_label)
+        info_row.addWidget(self.status_label)
+        info_row.addStretch(1)
+        layout.addLayout(info_row)
 
-        self._init_dashboard()
-        self._init_player_page()
-        self._init_pm_page()
-        self._init_ocr_page()
-        self._init_telegram_page()
-        self._init_logs_page()
+        btn_row = QHBoxLayout()
+        start_btn = QPushButton("Başlat")
+        stop_btn = QPushButton("Durdur")
+        shot_btn = QPushButton("Ekran Görüntüsü Kaydet")
+        start_btn.clicked.connect(self.start_capture)
+        stop_btn.clicked.connect(self.stop_capture)
+        shot_btn.clicked.connect(self.save_screenshot)
+        btn_row.addWidget(start_btn)
+        btn_row.addWidget(stop_btn)
+        btn_row.addWidget(shot_btn)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
 
-    def _init_dashboard(self) -> None:
-        page = QWidget()
-        vbox = QVBoxLayout(page)
+        pm_group = QGroupBox("Son PM Mesajları")
+        pm_layout = QVBoxLayout(pm_group)
+        pm_layout.addWidget(self.pm_preview_label)
+        pm_layout.addWidget(self.last_messages)
+        layout.addWidget(pm_group)
+        return tab
 
-        self.preview_label = QLabel("Önizleme bekleniyor...")
-        self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumHeight(480)
-        self.preview_label.setStyleSheet("background-color: #202020; border: 1px solid #444;")
-        vbox.addWidget(self.preview_label)
+    def _build_pm_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QGridLayout(tab)
 
-        button_layout = QHBoxLayout()
-        self.start_button = QPushButton("Başlat")
-        self.start_button.setStyleSheet("background-color: #2ecc71; color: white; padding: 8px 16px;")
-        self.stop_button = QPushButton("Durdur")
-        self.stop_button.setStyleSheet("background-color: #e74c3c; color: white; padding: 8px 16px;")
-        self.stop_button.setEnabled(False)
-        button_layout.addWidget(self.start_button)
-        button_layout.addWidget(self.stop_button)
-        vbox.addLayout(button_layout)
+        icon_thr_spin = QDoubleSpinBox()
+        icon_thr_spin.setRange(0.1, 1.0)
+        icon_thr_spin.setSingleStep(0.01)
+        icon_thr_spin.setValue(float(self.config.get("icon_thr", 0.8)))
+        icon_thr_spin.valueChanged.connect(lambda v: self._update_config("icon_thr", float(v)))
 
-        info_layout = QHBoxLayout()
-        self.fps_label = QLabel("FPS: 0.0")
-        self.last_event_label = QLabel("Son Olay: Yok")
-        info_layout.addWidget(self.fps_label)
-        info_layout.addWidget(self.last_event_label)
-        info_layout.addStretch(1)
-        vbox.addLayout(info_layout)
+        ocr_every_spin = QSpinBox()
+        ocr_every_spin.setRange(1, 30)
+        ocr_every_spin.setValue(int(self.config.get("ocr_every", 6)))
+        ocr_every_spin.valueChanged.connect(lambda v: self._update_config("ocr_every", int(v)))
 
-        self.stack.addWidget(page)
+        min_len_spin = QSpinBox()
+        min_len_spin.setRange(1, 200)
+        min_len_spin.setValue(int(self.config.get("new_msg_min_len", 2)))
+        min_len_spin.valueChanged.connect(lambda v: self._update_config("new_msg_min_len", int(v)))
 
-    def _init_player_page(self) -> None:
-        page = QWidget()
-        layout = QVBoxLayout(page)
+        dedupe_spin = QDoubleSpinBox()
+        dedupe_spin.setRange(0.0, 60.0)
+        dedupe_spin.setDecimals(1)
+        dedupe_spin.setValue(float(self.config.get("dedupe_window", 8.0)))
+        dedupe_spin.valueChanged.connect(lambda v: self._update_config("dedupe_window", float(v)))
 
-        slider_group = QGroupBox("Tespit Ayarları")
-        grid = QGridLayout(slider_group)
-
-        self.confidence_slider = QSlider(Qt.Horizontal)
-        self.confidence_slider.setRange(0, 100)
-        self.confidence_slider.setValue(int(self.config.state.ocr.confidence * 100))
-        grid.addWidget(QLabel("Minimum güven: %"), 0, 0)
-        grid.addWidget(self.confidence_slider, 0, 1)
-
-        self.overlap_slider = QSlider(Qt.Horizontal)
-        self.overlap_slider.setRange(1, 20)
-        self.overlap_slider.setValue(int(self.config.state.ocr.min_text_length))
-        grid.addWidget(QLabel("Minimum karakter sayısı"), 1, 0)
-        grid.addWidget(self.overlap_slider, 1, 1)
-
-        self.only_player_checkbox = QCheckBox("Sadece oyuncu tespitlerini göster")
-        self.only_player_checkbox.setChecked(self.config.state.detection.show_only_player)
-        grid.addWidget(self.only_player_checkbox, 2, 0, 1, 2)
-
-        layout.addWidget(slider_group)
-
-        self.capture_button = QPushButton("Ekran Görüntüsü Kaydet")
-        layout.addWidget(self.capture_button)
-
-        self.last_detections_list = QListWidget()
-        layout.addWidget(QLabel("Son 10 Tespit"))
-        layout.addWidget(self.last_detections_list)
-
-        self.stack.addWidget(page)
-
-    def _init_pm_page(self) -> None:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-
-        self.pm_detection_checkbox = QCheckBox("PM kutusu tespitini etkinleştir")
-        self.pm_detection_checkbox.setChecked(self.config.state.detection.enable_pm_box)
-        layout.addWidget(self.pm_detection_checkbox)
-
-        self.pm_auto_send_checkbox = QCheckBox("Tespit edilince otomatik Telegram gönder")
-        self.pm_auto_send_checkbox.setChecked(self.config.state.telegram.auto_send)
-        layout.addWidget(self.pm_auto_send_checkbox)
-
-        padding_layout = QHBoxLayout()
-        padding_layout.addWidget(QLabel("Kırpma padding:"))
-        self.padding_spin = QSpinBox()
-        self.padding_spin.setRange(0, 200)
-        self.padding_spin.setValue(self.config.state.telegram.padding)
-        padding_layout.addWidget(self.padding_spin)
-        padding_layout.addStretch(1)
-        layout.addLayout(padding_layout)
-
-        layout.addWidget(QLabel("Son gönderilen 3 PM önizlemesi"))
-        self.pm_preview_layout = QHBoxLayout()
-        for _ in range(3):
-            lbl = QLabel()
-            lbl.setFixedSize(160, 120)
-            lbl.setStyleSheet("background-color: #1f1f1f; border: 1px solid #555;")
-            lbl.setScaledContents(True)
-            self.pm_preview_layout.addWidget(lbl)
-        layout.addLayout(self.pm_preview_layout)
-
-        self.stack.addWidget(page)
-
-    def _init_ocr_page(self) -> None:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-
-        form = QGridLayout()
-
-        self.language_edit = QLineEdit(self.config.state.ocr.language)
-        form.addWidget(QLabel("Dil (lang)"), 0, 0)
-        form.addWidget(self.language_edit, 0, 1)
-
-        self.oem_spin = QSpinBox()
-        self.oem_spin.setRange(0, 3)
-        self.oem_spin.setValue(self.config.state.ocr.oem)
-        form.addWidget(QLabel("OEM"), 1, 0)
-        form.addWidget(self.oem_spin, 1, 1)
-
-        self.psm_spin = QSpinBox()
-        self.psm_spin.setRange(0, 13)
-        self.psm_spin.setValue(self.config.state.ocr.psm)
-        form.addWidget(QLabel("PSM"), 2, 0)
-        form.addWidget(self.psm_spin, 2, 1)
-
-        self.custom_config_edit = QLineEdit(self.config.state.ocr.custom_config)
-        form.addWidget(QLabel("Ek OCR Parametreleri"), 3, 0)
-        form.addWidget(self.custom_config_edit, 3, 1)
-
-        self.player_keywords_edit = QLineEdit(", ".join(self.config.state.ocr.player_keywords))
-        form.addWidget(QLabel("Oyuncu anahtar kelimeleri"), 4, 0)
-        form.addWidget(self.player_keywords_edit, 4, 1)
-
-        self.pm_keywords_edit = QLineEdit(", ".join(self.config.state.ocr.pm_keywords))
-        form.addWidget(QLabel("PM anahtar kelimeleri"), 5, 0)
-        form.addWidget(self.pm_keywords_edit, 5, 1)
-
-        layout.addLayout(form)
-
-        self.test_ocr_button = QPushButton("Tek Kare OCR Testi")
-        layout.addWidget(self.test_ocr_button)
-
-        self.stack.addWidget(page)
-
-    def _init_telegram_page(self) -> None:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-
-        self.bot_token_edit = QLineEdit(self.config.state.telegram.bot_token)
-        self.bot_token_edit.setEchoMode(QLineEdit.Password)
-        self.chat_id_edit = QLineEdit(self.config.state.telegram.chat_id)
-
-        layout.addWidget(QLabel("Bot Token"))
-        layout.addWidget(self.bot_token_edit)
-        layout.addWidget(QLabel("Chat ID"))
-        layout.addWidget(self.chat_id_edit)
-
-        self.test_message_button = QPushButton("Test Mesajı Gönder")
-        layout.addWidget(self.test_message_button)
-
-        self.stack.addWidget(page)
-
-    def _init_logs_page(self) -> None:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-
-        self.log_text = QTextEdit()
-        layout.addWidget(self.log_text)
-        self.log_panel = LogPanel(self.log_text)
-
-        self.clear_logs_button = QPushButton("Log'u temizle")
-        layout.addWidget(self.clear_logs_button)
-
-        self.stack.addWidget(page)
-
-    # endregion
-
-    def _apply_theme(self) -> None:
-        self.setStyleSheet(
-            """
-            QWidget {
-                background-color: #121212;
-                color: #f0f0f0;
-                font-family: 'Segoe UI';
-                font-size: 12pt;
-            }
-            QPushButton {
-                background-color: #2c3e50;
-                border-radius: 4px;
-                padding: 6px 12px;
-            }
-            QPushButton:hover {
-                background-color: #34495e;
-            }
-            QSlider::groove:horizontal {
-                height: 6px;
-                background: #2c3e50;
-            }
-            QSlider::handle:horizontal {
-                width: 14px;
-                background: #3498db;
-                margin: -4px 0;
-                border-radius: 6px;
-            }
-            QListWidget {
-                background-color: #1c1c1c;
-                border: none;
-            }
-            QTextEdit {
-                background-color: #1a1a1a;
-                border: 1px solid #333;
-            }
-            QGroupBox {
-                border: 1px solid #333;
-                margin-top: 12px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 3px;
-            }
-            """
+        checksum_box = QCheckBox("Checksum ile değişim algıla")
+        checksum_box.setChecked(bool(self.config.get("checksum_enabled", True)))
+        checksum_box.stateChanged.connect(
+            lambda state: self._update_config("checksum_enabled", state == Qt.Checked)
         )
 
-    def _connect_signals(self) -> None:
-        self.nav_list.currentRowChanged.connect(self.stack.setCurrentIndex)
-        self.start_button.clicked.connect(self.start_detection)
-        self.stop_button.clicked.connect(self.stop_detection)
-        self.capture_button.clicked.connect(self.save_capture)
-        self.confidence_slider.valueChanged.connect(self._update_confidence)
-        self.overlap_slider.valueChanged.connect(self._update_overlap)
-        self.only_player_checkbox.toggled.connect(self._update_show_only_player)
-        self.pm_detection_checkbox.toggled.connect(self._update_pm_detection)
-        self.pm_auto_send_checkbox.toggled.connect(self._update_pm_auto_send)
-        self.padding_spin.valueChanged.connect(self._update_padding)
-        self.language_edit.textChanged.connect(self._update_ocr_settings)
-        self.oem_spin.valueChanged.connect(self._update_ocr_settings)
-        self.psm_spin.valueChanged.connect(self._update_ocr_settings)
-        self.custom_config_edit.textChanged.connect(self._update_ocr_settings)
-        self.player_keywords_edit.textChanged.connect(self._update_ocr_settings)
-        self.pm_keywords_edit.textChanged.connect(self._update_ocr_settings)
-        self.bot_token_edit.textChanged.connect(self._update_telegram_settings)
-        self.chat_id_edit.textChanged.connect(self._update_telegram_settings)
-        self.test_message_button.clicked.connect(self._send_test_message)
-        self.test_ocr_button.clicked.connect(self._run_single_frame_test)
-        self.clear_logs_button.clicked.connect(lambda: self.log_text.clear())
+        scale_combo = QComboBox()
+        for label, value in [("0.5", 0.5), ("0.75", 0.75), ("1.0", 1.0)]:
+            scale_combo.addItem(label, value)
+        current_scale = float(self.config.get("preview_scale", 0.75))
+        idx = max(0, scale_combo.findData(current_scale))
+        scale_combo.setCurrentIndex(idx)
+        scale_combo.currentIndexChanged.connect(
+            lambda i: self._update_config("preview_scale", float(scale_combo.itemData(i)))
+        )
 
-        # Shortcuts
-        self.start_stop_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
-        self.start_stop_shortcut.activated.connect(self.toggle_detection)
+        layout.addWidget(QLabel("Icon Eşik"), 0, 0)
+        layout.addWidget(icon_thr_spin, 0, 1)
+        layout.addWidget(QLabel("OCR her N kare"), 1, 0)
+        layout.addWidget(ocr_every_spin, 1, 1)
+        layout.addWidget(QLabel("Minimum metin uzunluğu"), 2, 0)
+        layout.addWidget(min_len_spin, 2, 1)
+        layout.addWidget(QLabel("Dedupe saniye"), 3, 0)
+        layout.addWidget(dedupe_spin, 3, 1)
+        layout.addWidget(checksum_box, 4, 0, 1, 2)
+        layout.addWidget(QLabel("Önizleme ölçeği"), 5, 0)
+        layout.addWidget(scale_combo, 5, 1)
 
-        self.confidence_up = QShortcut(QKeySequence("C"), self)
-        self.confidence_up.activated.connect(lambda: self._nudge_slider(self.confidence_slider, 5))
-        self.confidence_down = QShortcut(QKeySequence("Shift+C"), self)
-        self.confidence_down.activated.connect(lambda: self._nudge_slider(self.confidence_slider, -5))
+        return tab
 
-        self.overlap_up = QShortcut(QKeySequence("O"), self)
-        self.overlap_up.activated.connect(lambda: self._nudge_slider(self.overlap_slider, 5))
-        self.overlap_down = QShortcut(QKeySequence("Shift+O"), self)
-        self.overlap_down.activated.connect(lambda: self._nudge_slider(self.overlap_slider, -5))
+    def _build_window_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QGridLayout(tab)
 
-    def _nudge_slider(self, slider: QSlider, delta: int) -> None:
-        slider.setValue(max(slider.minimum(), min(slider.maximum(), slider.value() + delta)))
+        process_hint_edit = QLineEdit(self.config.get("process_hint", "merlis"))
+        process_hint_edit.textChanged.connect(lambda text: self._update_config("process_hint", text))
 
-    def start_detection(self) -> None:
-        if self.worker and self.worker.isRunning():
-            self.log_panel.append("WARN", "Tespit zaten çalışıyor.")
+        pid_spin = QSpinBox()
+        pid_spin.setRange(0, 1_000_000)
+        pid_spin.setValue(int(self.config.get("pid", 0)))
+        pid_spin.valueChanged.connect(lambda v: self._update_config("pid", int(v)))
+
+        find_btn = QPushButton("Merlis'i Bul (PID)")
+
+        def _find_pid() -> None:
+            hint = process_hint_edit.text().strip()
+            pid = find_pid_by_name(hint)
+            if pid is None:
+                QMessageBox.warning(self, "PID bulunamadı", f"'{hint}' için süreç bulunamadı.")
+                return
+            pid_spin.setValue(pid)
+            self._update_config("pid", pid)
+            self.log("INFO", f"PID bulundu: {pid}")
+
+        find_btn.clicked.connect(_find_pid)
+
+        use_override = QCheckBox("ROI Override kullan")
+        use_override.setChecked(bool(self.config.get("use_roi_override", False)))
+        use_override.stateChanged.connect(
+            lambda state: self._update_config("use_roi_override", state == Qt.Checked)
+        )
+
+        roi_top = QSpinBox()
+        roi_top.setRange(0, 4000)
+        roi_top.setValue(int(self.config.get("roi_top", 0)))
+        roi_top.valueChanged.connect(lambda v: self._update_config("roi_top", int(v)))
+
+        roi_left = QSpinBox()
+        roi_left.setRange(0, 4000)
+        roi_left.setValue(int(self.config.get("roi_left", 0)))
+        roi_left.valueChanged.connect(lambda v: self._update_config("roi_left", int(v)))
+
+        roi_width = QSpinBox()
+        roi_width.setRange(0, 4000)
+        roi_width.setValue(int(self.config.get("roi_width", 0)))
+        roi_width.valueChanged.connect(lambda v: self._update_config("roi_width", int(v)))
+
+        roi_height = QSpinBox()
+        roi_height.setRange(0, 4000)
+        roi_height.setValue(int(self.config.get("roi_height", 0)))
+        roi_height.valueChanged.connect(lambda v: self._update_config("roi_height", int(v)))
+
+        layout.addWidget(QLabel("Process ipucu"), 0, 0)
+        layout.addWidget(process_hint_edit, 0, 1)
+        layout.addWidget(find_btn, 0, 2)
+        layout.addWidget(QLabel("PID"), 1, 0)
+        layout.addWidget(pid_spin, 1, 1)
+        layout.addWidget(use_override, 2, 0, 1, 3)
+        layout.addWidget(QLabel("Top"), 3, 0)
+        layout.addWidget(roi_top, 3, 1)
+        layout.addWidget(QLabel("Left"), 3, 2)
+        layout.addWidget(roi_left, 3, 3)
+        layout.addWidget(QLabel("Width"), 4, 0)
+        layout.addWidget(roi_width, 4, 1)
+        layout.addWidget(QLabel("Height"), 4, 2)
+        layout.addWidget(roi_height, 4, 3)
+        return tab
+
+    def _build_telegram_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QGridLayout(tab)
+
+        token_edit = QLineEdit(self.config.get("telegram_token", ""))
+        token_edit.setEchoMode(QLineEdit.Password)
+        chat_id_edit = QLineEdit(self.config.get("telegram_chat_id", ""))
+        auto_send_box = QCheckBox("Yeni PM gelince otomatik gönder")
+        auto_send_box.setChecked(bool(self.config.get("auto_send", True)))
+
+        token_edit.textChanged.connect(self._on_token_changed)
+        chat_id_edit.textChanged.connect(self._on_chat_id_changed)
+        auto_send_box.stateChanged.connect(
+            lambda state: self._update_config("auto_send", state == Qt.Checked)
+        )
+
+        test_button = QPushButton("Test Mesajı Gönder")
+
+        def _send_test() -> None:
+            if not self.telegram_client.ready():
+                QMessageBox.warning(self, "Telegram", "Token ve Chat ID giriniz.")
+                return
+            try:
+                self.telegram_client.send_text("Merlis PM OCR bot test mesajı")
+                QMessageBox.information(self, "Telegram", "Mesaj gönderildi.")
+            except Exception as exc:
+                QMessageBox.critical(self, "Telegram", f"Gönderim başarısız: {exc}")
+
+        test_button.clicked.connect(_send_test)
+
+        layout.addWidget(QLabel("Bot Token"), 0, 0)
+        layout.addWidget(token_edit, 0, 1)
+        layout.addWidget(QLabel("Chat ID"), 1, 0)
+        layout.addWidget(chat_id_edit, 1, 1)
+        layout.addWidget(auto_send_box, 2, 0, 1, 2)
+        layout.addWidget(test_button, 3, 0, 1, 2)
+        return tab
+
+    def _build_logs_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.addWidget(self.log_panel)
+        clear_btn = QPushButton("Log'u temizle")
+        clear_btn.clicked.connect(self.log_panel.clear)
+        layout.addWidget(clear_btn)
+        return tab
+
+    # Config helpers --------------------------------------------------
+    def _update_config(self, key: str, value: Any) -> None:
+        self.config[key] = value
+        save_config(self.config)
+        if key in {"telegram_token", "telegram_chat_id"}:
+            self.telegram_client.configure(
+                self.config.get("telegram_token", ""),
+                self.config.get("telegram_chat_id", ""),
+            )
+
+    def _on_token_changed(self, text: str) -> None:
+        self._update_config("telegram_token", text)
+
+    def _on_chat_id_changed(self, text: str) -> None:
+        self._update_config("telegram_chat_id", text)
+
+    # Capture lifecycle -----------------------------------------------
+    def start_capture(self) -> None:
+        if self.capture_thread and self.capture_thread.isRunning():
+            QMessageBox.information(self, "Bilgi", "Yakalama zaten çalışıyor.")
             return
-        self.worker = DetectionWorker(self.config.state)
-        self.worker.frameReady.connect(self._update_preview)
-        self.worker.statsUpdated.connect(self._update_stats)
-        self.worker.logMessage.connect(self.log_panel.append)
-        self.worker.detectionsUpdated.connect(self._handle_detections)
-        self.worker.pmPreviewReady.connect(self._handle_pm_preview)
-        self.worker.start()
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.log_panel.append("INFO", "Canlı tespit başlatıldı.")
+        self.capture_thread = CaptureWorker(dict(self.config))
+        self.capture_thread.frameReady.connect(self.on_frame_ready)
+        self.capture_thread.logMessage.connect(self.log)
+        self.capture_thread.statusUpdated.connect(self.update_status)
+        self.capture_thread.pmPreviewReady.connect(self.on_pm_preview)
+        self.capture_thread.frameForSave.connect(self._on_frame_for_save)
+        self.capture_thread.start()
+        self.update_status("Başlatılıyor")
 
-    def stop_detection(self) -> None:
-        if self.worker:
-            self.worker.stop()
-            self.worker.wait(2000)
-            self.worker = None
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self.log_panel.append("INFO", "Tespit durduruldu.")
+    def stop_capture(self) -> None:
+        if self.capture_thread:
+            self.capture_thread.stop()
+            self.capture_thread.wait(2000)
+            self.capture_thread = None
+            self.update_status("Durduruldu")
 
-    def toggle_detection(self) -> None:
-        if self.worker and self.worker.isRunning():
-            self.stop_detection()
-        else:
-            self.start_detection()
-
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
-        self.stop_detection()
-        self.config.save()
+    def closeEvent(self, event) -> None:  # noqa: D401
+        self.stop_capture()
+        save_config(self.config)
         super().closeEvent(event)
 
-    def _update_preview(self, image, detections: list) -> None:
-        pixmap = QPixmap.fromImage(image)
-        self.preview_label.setPixmap(pixmap.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-
-    def _update_stats(self, fps: float, last_event: str) -> None:
+    # Slots -----------------------------------------------------------
+    def on_frame_ready(self, qimage: QImage, fps: float) -> None:
         self.fps_label.setText(f"FPS: {fps:.1f}")
-        self.last_event_label.setText(f"Son Olay: {last_event}")
+        self.preview_label.setPixmap(QPixmap.fromImage(qimage))
 
-    def _handle_detections(self, detections: List[Detection]) -> None:
-        for det in detections:
-            if det.label != PLAYER_LABEL:
-                continue
-            entry = (
-                f"{datetime.now().strftime('%H:%M:%S')} - {det.text} "
-                f"({det.confidence * 100:.0f}%)"
-            )
-            self.player_detections.append(entry)
-        self.player_detections = self.player_detections[-10:]
-        self.last_detections_list.clear()
-        for item in reversed(self.player_detections):
-            self.last_detections_list.addItem(QListWidgetItem(item))
+    def on_pm_preview(self, qimage: QImage, text: str) -> None:
+        self.pm_preview_label.setPixmap(QPixmap.fromImage(qimage))
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        item_text = f"[{timestamp}] {text}" if text else f"[{timestamp}] (boş)"
+        self.last_messages.insertItem(0, item_text)
+        while self.last_messages.count() > 10:
+            self.last_messages.takeItem(self.last_messages.count() - 1)
 
-    def _handle_pm_preview(self, image) -> None:
-        pixmap = QPixmap.fromImage(image)
-        self.pm_previews.append(pixmap)
-        self.pm_previews = self.pm_previews[-3:]
-        for index in range(3):
-            label: QLabel = self.pm_preview_layout.itemAt(index).widget()  # type: ignore[assignment]
-            if index < len(self.pm_previews):
-                label.setPixmap(self.pm_previews[-(index + 1)].scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            else:
-                label.clear()
+    def _on_frame_for_save(self, frame: np.ndarray) -> None:
+        self.latest_overlay = frame
 
-    def _update_confidence(self, value: int) -> None:
-        self.config.state.ocr.confidence = value / 100
-        self.config.save()
+    def update_status(self, message: str) -> None:
+        self.status_label.setText(f"Durum: {message}")
 
-    def _update_overlap(self, value: int) -> None:
-        self.config.state.ocr.min_text_length = value
-        self.config.save()
+    def log(self, level: str, message: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        entry = f"[{timestamp}] {level}: {message}"
+        self.log_panel.append(entry)
 
-    def _update_show_only_player(self, checked: bool) -> None:
-        self.config.state.detection.show_only_player = checked
-        self.config.save()
-
-    def _update_pm_detection(self, checked: bool) -> None:
-        self.config.state.detection.enable_pm_box = checked
-        self.config.save()
-
-    def _update_pm_auto_send(self, checked: bool) -> None:
-        self.config.state.telegram.auto_send = checked
-        self.config.save()
-
-    def _update_padding(self, value: int) -> None:
-        self.config.state.telegram.padding = value
-        self.config.save()
-
-    def _update_ocr_settings(self) -> None:
-        self.config.state.ocr.language = self.language_edit.text()
-        self.config.state.ocr.oem = self.oem_spin.value()
-        self.config.state.ocr.psm = self.psm_spin.value()
-        self.config.state.ocr.custom_config = self.custom_config_edit.text()
-        self.config.state.ocr.player_keywords = self._parse_keywords(self.player_keywords_edit.text())
-        self.config.state.ocr.pm_keywords = self._parse_keywords(self.pm_keywords_edit.text())
-        self.config.save()
-
-    def _update_telegram_settings(self) -> None:
-        self.config.state.telegram.bot_token = self.bot_token_edit.text()
-        self.config.state.telegram.chat_id = self.chat_id_edit.text()
-        self.config.save()
-
-    @staticmethod
-    def _parse_keywords(text: str) -> List[str]:
-        return [part.strip() for part in text.split(",") if part.strip()]
-
-    def save_capture(self) -> None:
-        pixmap = self.preview_label.pixmap()
-        if pixmap is None:
-            QMessageBox.warning(self, "Uyarı", "Kaydedilecek görüntü yok.")
+    # Actions ---------------------------------------------------------
+    def save_screenshot(self) -> None:
+        if self.latest_overlay is None:
+            QMessageBox.information(self, "Ekran görüntüsü", "Henüz görüntü yok.")
             return
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        capture_dir = Path(self.config.state.detection.save_overlay_dir)
-        capture_dir.mkdir(parents=True, exist_ok=True)
-        filename = capture_dir / f"capture-{timestamp}.png"
-        pixmap.save(str(filename), "PNG")
-        self.log_panel.append("INFO", f"Ekran görüntüsü kaydedildi: {filename}")
-
-    def _send_test_message(self) -> None:
-        credentials = TelegramCredentials(
-            bot_token=self.config.state.telegram.bot_token,
-            chat_id=self.config.state.telegram.chat_id,
-        )
-        client = TelegramClient(credentials)
+        ensure_directories()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = CAPTURE_DIR / f"capture_{timestamp}.png"
         try:
-            client.send_message("Merlis Metin2 Bot test mesajı")
-            self.log_panel.append("INFO", "Test mesajı gönderildi.")
+            cv2.imwrite(str(filename), self.latest_overlay)
+            self.log("INFO", f"Ekran görüntüsü kaydedildi: {filename}")
         except Exception as exc:
-            self.log_panel.append("ERROR", f"Telegram mesajı gönderilemedi: {exc}")
-
-    def _run_single_frame_test(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Test için görüntü veya video seçiniz",
-            "",
-            "Video Dosyaları (*.mp4 *.avi *.mkv);;Görüntüler (*.png *.jpg *.jpeg);;Tümü (*.*)",
-        )
-        if not file_path:
-            return
-        suffix = Path(file_path).suffix.lower()
-        if suffix in {".png", ".jpg", ".jpeg", ".bmp"}:
-            image = cv2.imread(file_path)
-            if image is None:
-                self.log_panel.append("ERROR", "Görüntü okunamadı.")
-                return
-            self._predict_single_frame(image)
-        else:
-            self._run_test_video(file_path)
-
-    def _predict_single_frame(self, frame: np.ndarray) -> None:
-        detector = TesseractDetector(
-            language=self.config.state.ocr.language,
-            oem=self.config.state.ocr.oem,
-            psm=self.config.state.ocr.psm,
-            custom_config=self.config.state.ocr.custom_config,
-        )
-        try:
-            detections = detector.predict(
-                frame,
-                confidence=self.config.state.ocr.confidence,
-                min_text_length=self.config.state.ocr.min_text_length,
-                player_keywords=self.config.state.ocr.player_keywords,
-                pm_keywords=self.config.state.ocr.pm_keywords,
-                include_pm=self.config.state.detection.enable_pm_box,
-            )
-        except Exception as exc:
-            self.log_panel.append("ERROR", f"Test OCR işlemi başarısız: {exc}")
-            return
-        annotated = draw_detections(frame, detections)
-        qimage = convert_frame_to_qimage(annotated)
-        self.preview_label.setPixmap(
-            QPixmap.fromImage(qimage).scaled(
-                self.preview_label.size(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
-            )
-        )
-        self.log_panel.append("INFO", f"Test OCR tamamlandı. {len(detections)} eşleşme bulundu.")
-
-    def _run_test_video(self, file_path: str) -> None:
-        if self.worker and self.worker.isRunning():
-            QMessageBox.warning(self, "Uyarı", "Önce canlı tespiti durdurun.")
-            return
-        self.worker = DetectionWorker(self.config.state, video_source=file_path)
-        self.worker.frameReady.connect(self._update_preview)
-        self.worker.statsUpdated.connect(self._update_stats)
-        self.worker.logMessage.connect(self.log_panel.append)
-        self.worker.detectionsUpdated.connect(self._handle_detections)
-        self.worker.pmPreviewReady.connect(self._handle_pm_preview)
-        self.worker.start()
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.log_panel.append("INFO", "Test modu video oynatılıyor.")
+            QMessageBox.critical(self, "Kaydetme hatası", str(exc))
 
 
-def main() -> int:
+def apply_dark_theme(app: QApplication) -> None:
+    app.setStyle("Fusion")
+    palette = QPalette()
+    palette.setColor(QPalette.Window, Qt.black)
+    palette.setColor(QPalette.WindowText, Qt.white)
+    palette.setColor(QPalette.Base, Qt.black)
+    palette.setColor(QPalette.AlternateBase, Qt.gray)
+    palette.setColor(QPalette.ToolTipBase, Qt.white)
+    palette.setColor(QPalette.ToolTipText, Qt.white)
+    palette.setColor(QPalette.Text, Qt.white)
+    palette.setColor(QPalette.Button, Qt.gray)
+    palette.setColor(QPalette.ButtonText, Qt.white)
+    palette.setColor(QPalette.Highlight, Qt.darkYellow)
+    palette.setColor(QPalette.HighlightedText, Qt.black)
+    app.setPalette(palette)
+
+
+def main() -> None:
+    ensure_directories()
     app = QApplication(sys.argv)
-    app.setApplicationName("Merlis Metin2 Bot")
-
-    config = ConfigManager()
-    window = MainWindow(config)
+    apply_dark_theme(app)
+    window = MainWindow()
+    window.resize(960, 720)
     window.show()
-    result = app.exec_()
-    return result
+    sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
