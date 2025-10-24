@@ -33,6 +33,10 @@ DEFAULT_CLIENT: Dict[str, Any] = {
     "dedupe_window": 8.0,
     "new_msg_min_len": 2,
     "dx_prefer": True,
+    "yellow_detect_enabled": True,
+    "yellow_min_area": 1200,
+    "yellow_padding": 60,
+    "yellow_dedupe_window": 12.0,
 }
 
 DEFAULT_GLOBAL: Dict[str, Any] = {
@@ -46,15 +50,24 @@ DEFAULT_GLOBAL: Dict[str, Any] = {
 DEFAULT_AUTOMATION: Dict[str, Any] = {
     "reply_prefix": "#",
     "message_template": (
-        "🎯 {client_name} · PM #{client_index}\n\n"
-        "🗨️ İçerik:\n{text}\n\n"
-        "Yanıt için: {reply_prefix}{client_index} mesajınız"
+        "📨 {client_name} · PM #{client_index}\n"
+        "💬 Mesaj:\n{text}\n\n"
+        "Yanıtlamak için {reply_prefix}{client_index} <mesajınız> yazın."
     ),
-    "photo_caption": "PM #{client_index} · {client_name}",
+    "photo_caption": "PM #{client_index} — {client_name}",
     "awaiting_caption": "✉️ Yanıt bekleniyor",
     "delivered_template": "✅ PM #{client_index} gönderildi",
     "reply_timeout": 120.0,
     "space_delay": 0.5,
+    "space_hold": 0.5,
+    "yellow_message_template": (
+        "🟡 {client_name} · Yakındaki sarı oyuncu\n"
+        "📷 Ekran görüntüsü gönderildi.\n"
+        "{text_block}"
+        "Yanıtlamak için {reply_prefix}{client_index} <mesajınız> yazın."
+    ),
+    "yellow_photo_caption": "Sarı oyuncu #{client_index} — {client_name}",
+    "yellow_delivered_template": "✅ Sarı oyuncu yanıtlandı · {client_name}",
 }
 
 DEFAULT_CONFIG: Dict[str, Any] = {

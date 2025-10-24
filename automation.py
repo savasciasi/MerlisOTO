@@ -69,7 +69,13 @@ def key_press(vk: int, hold: float = 0.03) -> None:
     key_up(vk)
 
 
-def send_space(delay: float = 0.5) -> None:
+def press_enter(hold: float = 0.03) -> None:
+    """Send an ENTER key press with optional hold duration."""
+    key_press(win32con.VK_RETURN, hold)
+
+
+def send_space(delay: float = 0.0, hold: float = 0.5) -> None:
+    """Press and release the space key after an optional delay."""
     if delay > 0:
         time.sleep(delay)
-    key_press(win32con.VK_SPACE)
+    key_press(win32con.VK_SPACE, hold=max(hold, 0.01))

@@ -10,7 +10,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -40,7 +40,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from automation import bring_window_to_front, click_left, paste_text_via_clipboard, send_space
+from automation import bring_window_to_front, click_left, paste_text_via_clipboard, press_enter, send_space
 from config import ensure_directories, load_config, save_config
 from ocr_engine import OCREngine, OCREngineError
 from screen_capture import DXCapture, find_pid_by_name, get_window_info_by_pid
@@ -189,6 +189,7 @@ class CaptureWorker(QThread):
         self._last_checksum: Optional[str] = None
         self._last_text: Optional[str] = None
         self._last_text_time: Optional[datetime] = None
+        self._yellow_history: Dict[str, float] = {}
         self.initialization_error: Optional[str] = None
         self._ocr_engine: Optional[OCREngine] = None
         self._ocr_error_reported = False
@@ -250,10 +251,21 @@ class CaptureWorker(QThread):
             pass
         elif key == "reply_offset_x" or key == "reply_offset_y":
             self.client_config[key] = int(value)
-        elif key in {"icon_thr", "btn_thr", "preview_scale", "dedupe_window"}:
+        elif key in {"icon_thr", "btn_thr", "preview_scale", "dedupe_window", "yellow_dedupe_window"}:
             self.client_config[key] = float(value)
-        elif key in {"ocr_every", "new_msg_min_len", "pm_roi_offset_x", "pm_roi_offset_y", "pm_roi_width", "pm_roi_height"}:
+        elif key in {
+            "ocr_every",
+            "new_msg_min_len",
+            "pm_roi_offset_x",
+            "pm_roi_offset_y",
+            "pm_roi_width",
+            "pm_roi_height",
+            "yellow_min_area",
+            "yellow_padding",
+        }:
             self.client_config[key] = int(value)
+        elif key == "yellow_detect_enabled":
+            self.client_config[key] = bool(value)
 
     def apply_global_update(self, key: str, value: Any) -> None:
         self.global_config[key] = value
@@ -304,7 +316,7 @@ class CaptureWorker(QThread):
             if frame.ndim == 2:
                 frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
             self._frame_counter += 1
-            overlay_frame, pm_roi, pm_text = self._process_frame(frame)
+            overlay_frame, pm_roi, pm_text, yellow_events = self._process_frame(frame)
             now = time.perf_counter()
             fps = 1.0 / max(now - last_time, 1e-6)
             last_time = now
@@ -319,6 +331,8 @@ class CaptureWorker(QThread):
             self.frameForSave.emit(self.client_index, overlay_frame.copy())
             if pm_roi is not None and pm_text is not None:
                 self.pmPreviewReady.emit(self.client_index, numpy_to_qimage(pm_roi), pm_text)
+            for event in yellow_events:
+                self._handle_yellow_event(event)
         self.statusUpdated.emit(self.client_index, "Durduruldu")
         if self._capture:
             self._capture.stop()
@@ -358,10 +372,11 @@ class CaptureWorker(QThread):
         left, top, _, _ = self._region
         return left + int(x), top + int(y)
 
-    def _process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[str]]:
+    def _process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[str], List[Dict[str, Any]]]:
         display = frame.copy()
         pm_roi_img: Optional[np.ndarray] = None
         detected_text: Optional[str] = None
+        yellow_events: List[Dict[str, Any]] = []
         if self._pm_icon is None:
             if not self._reported_missing_icon:
                 self.logMessage.emit(
@@ -370,7 +385,8 @@ class CaptureWorker(QThread):
                     "PM ikon şablonu yüklenemediği için tespit devre dışı. assets/pm_icon.png dosyasını ekleyin.",
                 )
                 self._reported_missing_icon = True
-            return display, None, None
+            yellow_events = self._detect_yellow_players(frame, display)
+            return display, None, None, yellow_events
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         matches = match_template(gray, self._pm_icon, float(self.client_config.get("icon_thr", 0.8)))
         if matches:
@@ -392,7 +408,94 @@ class CaptureWorker(QThread):
                 pm_roi_img = roi_img
                 cv2.rectangle(display, (left, top), (right, bottom), (120, 255, 120), 2)
                 detected_text = self._maybe_run_ocr(frame, (top, left, bottom, right), roi_img, matches[0])
-        return display, pm_roi_img, detected_text
+        yellow_events = self._detect_yellow_players(frame, display)
+        return display, pm_roi_img, detected_text, yellow_events
+
+    def _detect_yellow_players(self, frame: np.ndarray, display: np.ndarray) -> List[Dict[str, Any]]:
+        if not self.client_config.get("yellow_detect_enabled", True):
+            return []
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        lower = np.array([18, 80, 80], dtype=np.uint8)
+        upper = np.array([36, 255, 255], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower, upper)
+        mask = cv2.medianBlur(mask, 5)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        min_area = float(self.client_config.get("yellow_min_area", 1200))
+        padding = int(self.client_config.get("yellow_padding", 60))
+        dedupe_window = float(self.client_config.get("yellow_dedupe_window", 12.0))
+        now = time.time()
+        events: List[Dict[str, Any]] = []
+        full_frame: Optional[np.ndarray] = None
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < max(100.0, min_area):
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            if w < 10 or h < 10:
+                continue
+            aspect = w / max(h, 1)
+            if aspect < 0.3 or aspect > 3.5:
+                continue
+            x1 = max(0, x - padding)
+            y1 = max(0, y - padding)
+            x2 = min(frame.shape[1], x + w + padding)
+            y2 = min(frame.shape[0], y + h + padding)
+            crop = frame[y1:y2, x1:x2].copy()
+            text_roi_top = min(frame.shape[0], y + h + 5)
+            text_roi_bottom = min(frame.shape[0], text_roi_top + max(30, h))
+            text_roi_left = max(0, x - padding)
+            text_roi_right = min(frame.shape[1], x + w + padding)
+            text_roi = frame[text_roi_top:text_roi_bottom, text_roi_left:text_roi_right].copy()
+            detected_text: Optional[str] = None
+            if text_roi.size > 0 and self._ocr_engine is not None:
+                try:
+                    candidate = self._ocr_engine.read(text_roi)
+                except OCREngineError as exc:
+                    if not self._ocr_error_reported:
+                        self.logMessage.emit(self.client_index, "ERROR", str(exc))
+                        self._ocr_error_reported = True
+                else:
+                    if candidate:
+                        detected_text = candidate
+            text_signature = hashlib.md5((detected_text or "").encode("utf-8", "ignore")).hexdigest()[:6]
+            key = f"{int(x/10)}-{int(y/10)}-{int(w/10)}-{int(h/10)}-{text_signature}"
+            last = self._yellow_history.get(key, 0.0)
+            if now - last < dedupe_window:
+                continue
+            self._yellow_history[key] = now
+            cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 255), 2)
+            label = "sari" if not detected_text else "sari+chat"
+            cv2.putText(
+                display,
+                label,
+                (x, max(14, y - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            if full_frame is None:
+                full_frame = frame.copy()
+            events.append(
+                {
+                    "box": (x1, y1, x2, y2),
+                    "crop": crop,
+                    "text": detected_text,
+                    "text_roi": text_roi if text_roi.size > 0 else None,
+                    "raw_box": (x, y, w, h),
+                    "timestamp": datetime.utcnow(),
+                    "frame": full_frame,
+                }
+            )
+        self._prune_yellow_history(now, dedupe_window * 2)
+        return events
+
+    def _prune_yellow_history(self, now: float, ttl: float) -> None:
+        expired = [key for key, ts in self._yellow_history.items() if now - ts > ttl]
+        for key in expired:
+            self._yellow_history.pop(key, None)
 
     def _extract_pm_roi(
         self,
@@ -464,8 +567,55 @@ class CaptureWorker(QThread):
     ) -> None:
         if self._start_pm_session(text, roi_image, frame, icon_box):
             return
-        self._notify_telegram(text, frame, roi_image, awaiting=False)
+        self._notify_pm(text, frame, roi_image, awaiting=False)
         self.statusUpdated.emit(self.client_index, "Telegram'a aktarıldı")
+
+    def _handle_yellow_event(self, event: Dict[str, Any]) -> None:
+        frame = event.get("frame")
+        crop = event.get("crop")
+        if frame is None and crop is None:
+            return
+        annotated = frame.copy() if isinstance(frame, np.ndarray) else (crop.copy() if isinstance(crop, np.ndarray) else None)
+        if annotated is None:
+            return
+        box = event.get("box") or (0, 0, annotated.shape[1], annotated.shape[0])
+        x1, y1, x2, y2 = box
+        cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
+        cv2.putText(
+            annotated,
+            "SARI",
+            (int(x1), max(16, int(y1) - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        text = (event.get("text") or "").strip()
+        text_block = f"💬 Algılanan sohbet:\n{text}\n\n" if text else ""
+        pending_created = False
+        with self._state_lock:
+            if self._pending_reply:
+                pending_created = False
+            else:
+                self._pending_reply = {
+                    "mode": "yellow",
+                    "started": time.time(),
+                    "screenshot": annotated.copy(),
+                    "roi": crop.copy() if isinstance(crop, np.ndarray) else None,
+                    "text": text,
+                    "text_screen": None,
+                    "send_screen": None,
+                }
+                self._awaiting_reply_flag = True
+                pending_created = True
+        if pending_created:
+            self.awaitingReply.emit(self.client_index, True)
+            self.statusUpdated.emit(self.client_index, "Sarı oyuncu yanıt bekliyor")
+            self.logMessage.emit(self.client_index, "INFO", "Sarı oyuncu algılandı, Telegram yanıtı bekleniyor.")
+        else:
+            self.logMessage.emit(self.client_index, "INFO", "Sarı oyuncu algılandı ancak aktif PM yanıtı devam ediyor.")
+        self._notify_yellow(text, annotated, crop, text_block, awaiting=pending_created)
 
     def _start_pm_session(
         self,
@@ -515,6 +665,7 @@ class CaptureWorker(QThread):
             screenshot = latest_frame.copy() if latest_frame is not None else frame
             with self._state_lock:
                 self._pending_reply = {
+                    "mode": "pm",
                     "text_screen": text_screen,
                     "send_screen": send_screen,
                     "started": time.time(),
@@ -525,7 +676,7 @@ class CaptureWorker(QThread):
                 self._awaiting_reply_flag = True
             self.awaitingReply.emit(self.client_index, True)
             self.statusUpdated.emit(self.client_index, "Yanıt bekleniyor")
-            self._notify_telegram(text, screenshot, roi_image, awaiting=True)
+            self._notify_pm(text, screenshot, roi_image, awaiting=True)
             return True
         except Exception as exc:  # pragma: no cover - automation safety
             self.logMessage.emit(self.client_index, "ERROR", f"PM otomasyonu sırasında hata: {exc}")
@@ -560,12 +711,14 @@ class CaptureWorker(QThread):
                 return
             text = self._reply_queue.popleft()
             pending = dict(self._pending_reply)
+        mode = pending.get("mode", "pm")
         success = self._deliver_reply(text, pending)
         if success:
             self._clear_pending_reply()
             self.awaitingReply.emit(self.client_index, False)
-            self.statusUpdated.emit(self.client_index, "Mesaj gönderildi")
-            self._notify_ack(text)
+            status = "PM gönderildi" if mode == "pm" else "Sarı oyuncuya yanıtlandı"
+            self.statusUpdated.emit(self.client_index, status)
+            self._notify_ack(text, mode)
         else:
             with self._state_lock:
                 self._reply_queue.appendleft(text)
@@ -584,20 +737,27 @@ class CaptureWorker(QThread):
         timeout = float(self.automation_config.get("reply_timeout", 120.0))
         if timeout <= 0:
             return
+        mode = pending.get("mode", "pm")
         if time.time() - float(pending.get("started", 0.0)) > timeout:
             self.logMessage.emit(self.client_index, "WARN", "Telegram yanıtı zaman aşımına uğradı.")
-            self._notify_timeout()
+            self._notify_timeout(mode)
             self._clear_pending_reply()
             self.awaitingReply.emit(self.client_index, False)
-            self.statusUpdated.emit(self.client_index, "Yanıt zaman aşımı")
+            status = "PM yanıtı zaman aşımı" if mode == "pm" else "Sarı oyuncu yanıtı zaman aşımı"
+            self.statusUpdated.emit(self.client_index, status)
 
-    def _notify_timeout(self) -> None:
+    def _notify_timeout(self, mode: str) -> None:
         if not self._auto_send or not self._telegram.ready():
             return
         try:
-            self._telegram.send_text(
-                f"⚠️ PM #{self.client_index + 1} ({self.client_name}) yanıt beklerken zaman aşımına uğradı."
-            )
+            if mode == "yellow":
+                self._telegram.send_text(
+                    f"⚠️ Sarı oyuncu yanıtı zaman aşımına uğradı · {self.client_name}"
+                )
+            else:
+                self._telegram.send_text(
+                    f"⚠️ PM #{self.client_index + 1} ({self.client_name}) yanıt beklerken zaman aşımına uğradı."
+                )
         except Exception as exc:  # pragma: no cover
             self.logMessage.emit(self.client_index, "ERROR", f"Telegram uyarısı gönderilemedi: {exc}")
 
@@ -605,6 +765,15 @@ class CaptureWorker(QThread):
         try:
             if self._window_hwnd:
                 bring_window_to_front(self._window_hwnd)
+            mode = pending.get("mode", "pm")
+            if mode == "yellow":
+                press_enter(hold=0.05)
+                time.sleep(0.15)
+                paste_text_via_clipboard(text)
+                time.sleep(0.15)
+                press_enter(hold=0.05)
+                self.logMessage.emit(self.client_index, "INFO", f"Sarı oyuncuya yanıt gönderildi: {text}")
+                return True
             target = pending.get("text_screen")
             send_target = pending.get("send_screen")
             if target is None or send_target is None:
@@ -616,7 +785,10 @@ class CaptureWorker(QThread):
             click_left(*send_target)
             time.sleep(0.25)
             self._close_pm_window()
-            send_space(delay=float(self.automation_config.get("space_delay", 0.5)))
+            send_space(
+                delay=float(self.automation_config.get("space_delay", 0.5)),
+                hold=float(self.automation_config.get("space_hold", 0.5)),
+            )
             self.logMessage.emit(self.client_index, "INFO", f"Oyuna mesaj gönderildi: {text}")
             return True
         except Exception as exc:  # pragma: no cover
@@ -643,17 +815,20 @@ class CaptureWorker(QThread):
             return
         click_left(*screen)
 
-    def _notify_ack(self, reply_text: str) -> None:
+    def _notify_ack(self, reply_text: str, mode: str) -> None:
         if not self._auto_send or not self._telegram.ready():
             return
-        template = self.automation_config.get("delivered_template", "✅ PM gönderildi")
-        message = self._format_template(template, reply_text)
+        if mode == "yellow":
+            template = self.automation_config.get("yellow_delivered_template", "✅ Sarı oyuncu yanıtlandı")
+        else:
+            template = self.automation_config.get("delivered_template", "✅ PM gönderildi")
+        message = self._format_template(template, reply_text, text_block="")
         try:
             self._telegram.send_text(f"{message}\nGönderilen mesaj: {reply_text}")
         except Exception as exc:  # pragma: no cover
             self.logMessage.emit(self.client_index, "ERROR", f"Telegram bildiriminde hata: {exc}")
 
-    def _notify_telegram(
+    def _notify_pm(
         self,
         text: str,
         screenshot: np.ndarray,
@@ -679,13 +854,43 @@ class CaptureWorker(QThread):
         except Exception as exc:  # pragma: no cover
             self.logMessage.emit(self.client_index, "ERROR", f"Telegram gönderimi başarısız: {exc}")
 
-    def _format_template(self, template: str, text: str) -> str:
+    def _notify_yellow(
+        self,
+        text: str,
+        annotated: np.ndarray,
+        crop: Optional[np.ndarray],
+        text_block: str,
+        awaiting: bool,
+    ) -> None:
+        if not self._auto_send or not self._telegram.ready():
+            return
+        try:
+            template = self.automation_config.get("yellow_message_template", "{text}")
+            message = self._format_template(template, text, text_block=text_block)
+            if awaiting:
+                awaiting_caption = self.automation_config.get("awaiting_caption", "")
+                if awaiting_caption:
+                    message = f"{message}\n\n{awaiting_caption}"
+            self._telegram.send_text(message)
+            caption_template = self.automation_config.get("yellow_photo_caption", "Sarı oyuncu #{client_index}")
+            caption = self._format_template(caption_template, text, text_block=text_block)
+            self._telegram.send_photo(annotated, caption=caption)
+            if isinstance(crop, np.ndarray) and crop.size > 0:
+                self._telegram.send_photo(crop, caption="Yakın plan")
+            if text:
+                self._telegram.send_text(f"💬 Algılanan sohbet:\n{text}")
+            self.logMessage.emit(self.client_index, "INFO", "Sarı oyuncu bildirimi Telegram'a gönderildi.")
+        except Exception as exc:  # pragma: no cover
+            self.logMessage.emit(self.client_index, "ERROR", f"Sarı oyuncu bildirimi gönderilemedi: {exc}")
+
+    def _format_template(self, template: str, text: str, **extra: Any) -> str:
         values = {
             "client_index": self.client_index + 1,
             "client_name": self.client_name,
             "text": text,
             "reply_prefix": self.automation_config.get("reply_prefix", "#"),
         }
+        values.update(extra)
         try:
             return template.format(**values)
         except Exception:
@@ -1191,6 +1396,38 @@ class MainWindow(QMainWindow):
         pm_form.addRow(checksum_check)
         form_layout.addWidget(pm_box)
 
+        yellow_box = QGroupBox("Sarı Oyuncu Algılama")
+        yellow_form = QFormLayout(yellow_box)
+        yellow_enable = QCheckBox("Sarı oyuncu taramasını etkinleştir")
+        yellow_enable.setChecked(bool(client_cfg.get("yellow_detect_enabled", True)))
+        yellow_enable.stateChanged.connect(
+            lambda state, i=idx: self._update_client_config(i, "yellow_detect_enabled", state == Qt.Checked)
+        )
+        yellow_form.addRow(yellow_enable)
+
+        yellow_area = QSpinBox()
+        yellow_area.setRange(200, 20000)
+        yellow_area.setValue(int(client_cfg.get("yellow_min_area", 1200)))
+        yellow_area.valueChanged.connect(lambda value, i=idx: self._update_client_config(i, "yellow_min_area", int(value)))
+        yellow_form.addRow("Minimum alan", yellow_area)
+
+        yellow_padding = QSpinBox()
+        yellow_padding.setRange(0, 400)
+        yellow_padding.setValue(int(client_cfg.get("yellow_padding", 60)))
+        yellow_padding.valueChanged.connect(lambda value, i=idx: self._update_client_config(i, "yellow_padding", int(value)))
+        yellow_form.addRow("Kırpma padding", yellow_padding)
+
+        yellow_dedupe = QDoubleSpinBox()
+        yellow_dedupe.setRange(1.0, 120.0)
+        yellow_dedupe.setDecimals(1)
+        yellow_dedupe.setSingleStep(0.5)
+        yellow_dedupe.setValue(float(client_cfg.get("yellow_dedupe_window", 12.0)))
+        yellow_dedupe.valueChanged.connect(
+            lambda value, i=idx: self._update_client_config(i, "yellow_dedupe_window", float(value))
+        )
+        yellow_form.addRow("Dedupe (sn)", yellow_dedupe)
+        form_layout.addWidget(yellow_box)
+
         automation_box = QGroupBox("Otomasyon")
         automation_form = QFormLayout(automation_box)
         workflow_check = QCheckBox("PM otomasyonunu etkinleştir")
@@ -1255,6 +1492,21 @@ class MainWindow(QMainWindow):
         delivered_template.textChanged.connect(lambda text: self._update_automation_config("delivered_template", text))
         form.addRow("Gönderim bildirimi", delivered_template)
 
+        yellow_template = QTextEdit()
+        yellow_template.setPlainText(automation_cfg.get("yellow_message_template", "{text}"))
+        yellow_template.textChanged.connect(
+            lambda: self._update_automation_config("yellow_message_template", yellow_template.toPlainText())
+        )
+        form.addRow("Sarı oyuncu mesajı", yellow_template)
+
+        yellow_caption = QLineEdit(automation_cfg.get("yellow_photo_caption", "Sarı oyuncu #{client_index}"))
+        yellow_caption.textChanged.connect(lambda text: self._update_automation_config("yellow_photo_caption", text))
+        form.addRow("Sarı oyuncu foto başlığı", yellow_caption)
+
+        yellow_delivered = QLineEdit(automation_cfg.get("yellow_delivered_template", "✅ Sarı oyuncu yanıtlandı"))
+        yellow_delivered.textChanged.connect(lambda text: self._update_automation_config("yellow_delivered_template", text))
+        form.addRow("Sarı oyuncu gönderim bildirimi", yellow_delivered)
+
         awaiting_edit = QLineEdit(automation_cfg.get("awaiting_caption", "✉️ Yanıt bekleniyor"))
         awaiting_edit.textChanged.connect(lambda text: self._update_automation_config("awaiting_caption", text))
         form.addRow("Yanıt bekleniyor etiketi", awaiting_edit)
@@ -1273,6 +1525,14 @@ class MainWindow(QMainWindow):
         space_delay_spin.setValue(float(automation_cfg.get("space_delay", 0.5)))
         space_delay_spin.valueChanged.connect(lambda value: self._update_automation_config("space_delay", float(value)))
         form.addRow("Space gecikmesi", space_delay_spin)
+
+        space_hold_spin = QDoubleSpinBox()
+        space_hold_spin.setRange(0.05, 2.0)
+        space_hold_spin.setDecimals(2)
+        space_hold_spin.setSingleStep(0.05)
+        space_hold_spin.setValue(float(automation_cfg.get("space_hold", 0.5)))
+        space_hold_spin.valueChanged.connect(lambda value: self._update_automation_config("space_hold", float(value)))
+        form.addRow("Space basma süresi", space_hold_spin)
 
         test_button = QPushButton("Telegram Test Mesajı Gönder")
         test_button.setObjectName("PrimaryButton")
