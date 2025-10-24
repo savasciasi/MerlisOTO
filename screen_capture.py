@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import threading
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import psutil
@@ -38,10 +38,59 @@ def _virtual_bounds() -> Optional[Rect]:
     return left, top, left + width, top + height
 
 
+def _monitor_rects() -> List[Rect]:
+    rects: List[Rect] = []
+    if win32api is None:
+        return rects
+
+    def _cb(handle, hdc, rect, data):  # pragma: no cover - callback from Windows API
+        try:
+            rects.append((int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])))
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32api.EnumDisplayMonitors(None, None, _cb, None)
+    except Exception:
+        return []
+    return rects
+
+
 def _resolve_output_region(region: Rect) -> Tuple[Optional[int], Rect, Optional[Rect], Optional[Rect]]:
     """Resolve dxcam region ensuring compatibility with multi-monitor layouts."""
 
+    monitors = _monitor_rects()
     bounds = _virtual_bounds()
+    monitor_idx: Optional[int] = None
+    monitor_rect: Optional[Rect] = None
+    if monitors:
+        cx = int((region[0] + region[2]) / 2)
+        cy = int((region[1] + region[3]) / 2)
+        for idx, (ml, mt, mr, mb) in enumerate(monitors):
+            if ml <= cx < mr and mt <= cy < mb:
+                monitor_idx = idx
+                monitor_rect = (ml, mt, mr, mb)
+                break
+    if monitor_rect is not None:
+        ml, mt, mr, mb = monitor_rect
+        rel = (
+            int(region[0] - ml),
+            int(region[1] - mt),
+            int(region[2] - ml),
+            int(region[3] - mt),
+        )
+        width = max(1, mr - ml)
+        height = max(1, mb - mt)
+        capture_region = (
+            max(0, min(width, rel[0])),
+            max(0, min(height, rel[1])),
+            max(0, min(width, rel[2])),
+            max(0, min(height, rel[3])),
+        )
+        if capture_region[2] > capture_region[0] and capture_region[3] > capture_region[1]:
+            return monitor_idx, capture_region, None, monitor_rect
+
     if bounds is None:
         return None, region, None, None
     left, top, right, bottom = bounds
@@ -54,9 +103,9 @@ def _resolve_output_region(region: Rect) -> Tuple[Optional[int], Rect, Optional[
     width = max(1, right - left)
     height = max(1, bottom - top)
     inside = 0 <= x1 < width and 0 <= y1 < height and 0 < x2 <= width and 0 < y2 <= height
-    needs_union = (region[0] < 0 or region[1] < 0) or not inside
+    needs_union = (region[0] < left or region[1] < top) or not inside
     if needs_union:
-        capture_region: Rect = (0, 0, width, height)
+        capture_region = (0, 0, width, height)
         crop_rect = (
             max(0, min(width, x1)),
             max(0, min(height, y1)),
