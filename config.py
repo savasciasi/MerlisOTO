@@ -28,7 +28,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "dedupe_window": 8.0,
     "new_msg_min_len": 2,
     "dx_prefer": True,
-    "ocr_use_gpu": True,
+    "tesseract_path": r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+    "ocr_lang": "tur+eng",
     "telegram_token": "",
     "telegram_chat_id": "",
 }
