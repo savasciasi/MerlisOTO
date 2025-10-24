@@ -6,7 +6,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List
 
-CONFIG_PATH = Path("config.json")
+ROOT_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = ROOT_DIR / "config.json"
 
 DEFAULT_CLIENT: Dict[str, Any] = {
     "name": "Client 1",
@@ -68,8 +69,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
 def ensure_directories() -> None:
     """Create required directories for assets and captures."""
-    Path("captures").mkdir(parents=True, exist_ok=True)
-    Path("assets").mkdir(exist_ok=True)
+    (ROOT_DIR / "captures").mkdir(parents=True, exist_ok=True)
+    (ROOT_DIR / "assets").mkdir(exist_ok=True)
 
 
 def _merge_dict(template: Dict[str, Any], values: Dict[str, Any] | None) -> Dict[str, Any]:

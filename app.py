@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPalette, QPixmap, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication,
@@ -29,7 +29,6 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -48,10 +47,11 @@ from screen_capture import DXCapture, find_pid_by_name, get_window_info_by_pid
 from templates import match_template
 from telegram_client import TelegramClient
 
-ASSET_ICON = Path("assets/pm_icon.png")
-ASSET_SEND = Path("assets/pm_send_btn.png")
-ASSET_CLOSE = Path("assets/pm_close_x.png")
-CAPTURE_DIR = Path("captures")
+BASE_DIR = Path(__file__).resolve().parent
+ASSET_ICON = BASE_DIR / "assets" / "pm_icon.png"
+ASSET_SEND = BASE_DIR / "assets" / "pm_send_btn.png"
+ASSET_CLOSE = BASE_DIR / "assets" / "pm_close_x.png"
+CAPTURE_DIR = BASE_DIR / "captures"
 
 
 def numpy_to_qimage(frame: np.ndarray) -> QImage:
@@ -177,9 +177,13 @@ class CaptureWorker(QThread):
             token=self.global_config.get("telegram_token", ""),
             chat_id=self.global_config.get("telegram_chat_id", ""),
         )
-        self._pm_icon = cv2.imread(str(ASSET_ICON), cv2.IMREAD_GRAYSCALE)
-        self._pm_send = cv2.imread(str(ASSET_SEND), cv2.IMREAD_GRAYSCALE)
-        self._pm_close = cv2.imread(str(ASSET_CLOSE), cv2.IMREAD_GRAYSCALE)
+        self._template_warnings: list[tuple[str, str]] = []
+        self._pm_icon = self._load_template(ASSET_ICON, "PM ikon (pm_icon.png)")
+        self._pm_send = self._load_template(ASSET_SEND, "Gönder butonu (pm_send_btn.png)")
+        self._pm_close = self._load_template(ASSET_CLOSE, "Kapat simgesi (pm_close_x.png)")
+        self._reported_missing_icon = False
+        self._reported_missing_send = False
+        self._reported_missing_close = False
         self._frame_counter = 0
         self._fps_window: deque[float] = deque(maxlen=120)
         self._last_checksum: Optional[str] = None
@@ -201,6 +205,26 @@ class CaptureWorker(QThread):
         except OCREngineError as exc:
             self._ocr_engine = None
             self.initialization_error = str(exc)
+
+    def _load_template(self, path: Path, label: str) -> Optional[np.ndarray]:
+        if not path.exists():
+            self._template_warnings.append(
+                (
+                    "WARN",
+                    f"{label} bulunamadı: {path}. Lütfen assets klasörüne doğru şablon dosyasını ekleyin.",
+                )
+            )
+            return None
+        image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            self._template_warnings.append(
+                (
+                    "WARN",
+                    f"{label} okunamadı: {path}. Dosyanın PNG formatında olduğundan emin olun.",
+                )
+            )
+            return None
+        return image
 
     # Additional methods will be appended later
 
@@ -252,6 +276,8 @@ class CaptureWorker(QThread):
         if region is None:
             self.logMessage.emit(self.client_index, "ERROR", "Geçerli pencere bölgesi bulunamadı. PID/ROI ayarlarını kontrol edin.")
             return
+        for level, message in self._template_warnings:
+            self.logMessage.emit(self.client_index, level, message)
         try:
             self._capture = DXCapture(region=region, prefer_dx=bool(self.client_config.get("dx_prefer", True)))
             self._capture.start()
@@ -336,28 +362,36 @@ class CaptureWorker(QThread):
         display = frame.copy()
         pm_roi_img: Optional[np.ndarray] = None
         detected_text: Optional[str] = None
-        if self._pm_icon is not None:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            matches = match_template(gray, self._pm_icon, float(self.client_config.get("icon_thr", 0.8)))
-            if matches:
-                x1, y1, x2, y2, score = matches[0]
-                cv2.rectangle(display, (x1, y1), (x2, y2), (0, 200, 255), 2)
-                cv2.putText(
-                    display,
-                    f"icon {score:.2f}",
-                    (x1, max(12, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 200, 255),
-                    1,
-                    cv2.LINE_AA,
+        if self._pm_icon is None:
+            if not self._reported_missing_icon:
+                self.logMessage.emit(
+                    self.client_index,
+                    "WARN",
+                    "PM ikon şablonu yüklenemediği için tespit devre dışı. assets/pm_icon.png dosyasını ekleyin.",
                 )
-                roi_info = self._extract_pm_roi(frame, (x1, y1, x2, y2))
-                if roi_info is not None:
-                    top, left, bottom, right, roi_img = roi_info
-                    pm_roi_img = roi_img
-                    cv2.rectangle(display, (left, top), (right, bottom), (120, 255, 120), 2)
-                    detected_text = self._maybe_run_ocr(frame, (top, left, bottom, right), roi_img, matches[0])
+                self._reported_missing_icon = True
+            return display, None, None
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        matches = match_template(gray, self._pm_icon, float(self.client_config.get("icon_thr", 0.8)))
+        if matches:
+            x1, y1, x2, y2, score = matches[0]
+            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 200, 255), 2)
+            cv2.putText(
+                display,
+                f"icon {score:.2f}",
+                (x1, max(12, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 200, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            roi_info = self._extract_pm_roi(frame, (x1, y1, x2, y2))
+            if roi_info is not None:
+                top, left, bottom, right, roi_img = roi_info
+                pm_roi_img = roi_img
+                cv2.rectangle(display, (left, top), (right, bottom), (120, 255, 120), 2)
+                detected_text = self._maybe_run_ocr(frame, (top, left, bottom, right), roi_img, matches[0])
         return display, pm_roi_img, detected_text
 
     def _extract_pm_roi(
@@ -443,6 +477,15 @@ class CaptureWorker(QThread):
         if not self.client_config.get("workflow_enabled", True):
             return False
         if self._capture is None or self._region is None:
+            return False
+        if self._pm_send is None:
+            if not self._reported_missing_send:
+                self.logMessage.emit(
+                    self.client_index,
+                    "WARN",
+                    "pm_send_btn.png şablonu bulunamadığı için otomatik yanıt devre dışı. assets klasörünü kontrol edin.",
+                )
+                self._reported_missing_send = True
             return False
         try:
             if self._window_hwnd:
@@ -581,6 +624,15 @@ class CaptureWorker(QThread):
             return False
 
     def _close_pm_window(self) -> None:
+        if self._pm_close is None:
+            if not self._reported_missing_close:
+                self.logMessage.emit(
+                    self.client_index,
+                    "WARN",
+                    "pm_close_x.png şablonu eksik. PM penceresi otomatik kapatılamıyor.",
+                )
+                self._reported_missing_close = True
+            return
         match, _ = self._find_template(self._pm_close, float(self.client_config.get("btn_thr", 0.8)), attempts=6)
         if match is None:
             self.logMessage.emit(self.client_index, "WARN", "PM pencere kapatma simgesi bulunamadı.")
@@ -650,9 +702,8 @@ class MainWindow(QMainWindow):
         self.config = load_config()
         self.client_states = [ClientUIState(config=c) for c in self.config.get("clients", [])]
         self.log_view: Optional[QTextEdit] = None
-        self.nav_list: Optional[QListWidget] = None
         self.stack: Optional[QStackedWidget] = None
-        self.nav_items: list[QListWidgetItem] = []
+        self.nav_buttons: list[QPushButton] = []
         self.telegram_sender = TelegramClient(
             self.config.get("global", {}).get("telegram_token", ""),
             self.config.get("global", {}).get("telegram_chat_id", ""),
@@ -684,95 +735,190 @@ class MainWindow(QMainWindow):
             app.setPalette(palette)
         self.setStyleSheet(
             """
-            QMainWindow { background-color: #11151c; }
+            QMainWindow { background-color: #0f172a; }
+            QFrame#NavPanel {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #111c2e, stop:1 #0b1220);
+                border-radius: 24px;
+                border: 1px solid #1e2b44;
+            }
+            QLabel#BrandTitle {
+                color: #f8fafc;
+                font-size: 22px;
+                font-weight: 700;
+            }
+            QLabel#BrandSubtitle {
+                color: #9fb3d1;
+                font-size: 12px;
+            }
+            QPushButton#NavButton {
+                background-color: transparent;
+                color: #c7d5f5;
+                border: none;
+                text-align: left;
+                padding: 12px 18px;
+                border-radius: 12px;
+                font-size: 14px;
+                font-weight: 600;
+            }
+            QPushButton#NavButton:hover {
+                background-color: rgba(61, 125, 255, 0.14);
+                color: #f1f5ff;
+            }
+            QPushButton#NavButton:checked {
+                background-color: #3d7dff;
+                color: #ffffff;
+            }
+            QFrame#ContentFrame { background: transparent; }
+            QFrame#HeroBanner {
+                background: rgba(33, 47, 75, 0.85);
+                border: 1px solid #24324d;
+                border-radius: 20px;
+                padding: 20px;
+            }
+            QLabel#HeroTitle {
+                font-size: 24px;
+                font-weight: 700;
+                color: #f8fbff;
+            }
+            QLabel#HeroSubtitle {
+                color: #a9b8d9;
+                font-size: 13px;
+            }
             QFrame#Card {
-                background-color: #18202d;
-                border: 1px solid #232d3f;
-                border-radius: 16px;
+                background-color: #141c2f;
+                border: 1px solid #1f2b46;
+                border-radius: 20px;
             }
             QLabel { color: #e8eef9; }
             QLabel#TitleLabel { font-size: 20px; font-weight: 600; }
             QLabel#AwaitBadge {
-                background-color: #3d7dff;
-                color: white;
+                background-color: #22d3ee;
+                color: #04121f;
                 padding: 4px 12px;
                 border-radius: 12px;
                 font-weight: 600;
             }
-            QLabel#StatusLabel { color: #8ea8ff; font-weight: 600; }
-            QLabel#FpsLabel { color: #9fb6ff; font-weight: 600; }
+            QLabel#StatusLabel { color: #7dd3fc; font-weight: 600; }
+            QLabel#FpsLabel { color: #a5b4fc; font-weight: 600; }
             QPushButton {
-                background-color: #253041;
+                background-color: #1c2539;
                 color: #f0f4ff;
-                border-radius: 9px;
-                padding: 8px 18px;
-                border: 1px solid #2f3a4f;
+                border-radius: 10px;
+                padding: 9px 20px;
+                border: 1px solid #27334a;
             }
-            QPushButton:hover { background-color: #2f3d52; }
-            QPushButton#PrimaryButton { background-color: #3d7dff; border-color: #3d7dff; color: white; }
+            QPushButton:hover { background-color: #26304a; }
+            QPushButton#PrimaryButton {
+                background-color: #3d7dff;
+                border-color: #3d7dff;
+                color: #ffffff;
+            }
             QPushButton#PrimaryButton:hover { background-color: #356ceb; }
-            QPushButton#DangerButton { background-color: #c4475d; border-color: #c4475d; color: white; }
-            QPushButton#DangerButton:hover { background-color: #b03b50; }
+            QPushButton#DangerButton {
+                background-color: #ef4444;
+                border-color: #ef4444;
+                color: #ffffff;
+            }
+            QPushButton#DangerButton:hover { background-color: #dc2626; }
             QListWidget {
-                background-color: #161d27;
+                background-color: #121a2d;
                 border: none;
                 padding: 12px;
                 color: #d6deeb;
-                border-radius: 14px;
+                border-radius: 16px;
             }
-            QListWidget::item { border-radius: 10px; padding: 14px; margin: 4px; }
-            QListWidget::item:selected { background-color: #3d7dff; color: #ffffff; }
+            QListWidget::item { border-radius: 12px; padding: 12px; margin: 2px 0; }
+            QListWidget::item:selected { background-color: rgba(61, 125, 255, 0.25); color: #ffffff; }
             QGroupBox {
-                border: 1px solid #222b39;
-                border-radius: 14px;
-                margin-top: 18px;
+                border: 1px solid #25324b;
+                border-radius: 18px;
+                margin-top: 20px;
                 color: #9fa9c1;
                 font-weight: 600;
             }
-            QGroupBox::title { subcontrol-origin: margin; left: 16px; padding: 0 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 18px; padding: 0 6px; }
             QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {
-                background-color: #1a2330;
+                background-color: #16223a;
                 color: #f0f4ff;
                 border: 1px solid #273142;
-                border-radius: 8px;
-                padding: 6px 8px;
+                border-radius: 10px;
+                padding: 8px 10px;
             }
             QTextEdit { min-height: 140px; }
             QCheckBox { color: #d6deeb; }
             QScrollArea { border: none; }
-            QListWidget#LastMessages { background-color: #141a24; border: 1px solid #232e3f; border-radius: 10px; }
-            QTextEdit#LogView { background-color: #141a24; border: 1px solid #232e3f; border-radius: 12px; }
+            QListWidget#LastMessages { background-color: #131c30; border: 1px solid #23304b; border-radius: 14px; }
+            QTextEdit#LogView { background-color: #131c30; border: 1px solid #23304b; border-radius: 14px; }
             """
         )
 
     def _build_ui(self) -> None:
         central = QWidget()
         root_layout = QHBoxLayout(central)
-        root_layout.setContentsMargins(20, 20, 20, 20)
-        root_layout.setSpacing(20)
+        root_layout.setContentsMargins(24, 24, 24, 24)
+        root_layout.setSpacing(24)
 
-        self.nav_list = QListWidget()
-        self.nav_list.setFixedWidth(220)
-        self.nav_list.setSpacing(8)
-        self.nav_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.nav_list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        nav_panel = QFrame()
+        nav_panel.setObjectName("NavPanel")
+        nav_layout = QVBoxLayout(nav_panel)
+        nav_layout.setContentsMargins(20, 28, 20, 28)
+        nav_layout.setSpacing(18)
+
+        brand = QLabel("Merlis PM")
+        brand.setObjectName("BrandTitle")
+        brand_sub = QLabel("Çift Merlis istemcisi için gerçek zamanlı PM yakalama ve otomasyon")
+        brand_sub.setObjectName("BrandSubtitle")
+        brand_sub.setWordWrap(True)
+        nav_layout.addWidget(brand)
+        nav_layout.addWidget(brand_sub)
+        nav_layout.addSpacing(12)
+
         nav_titles = [
-            "Genel Bakış",
+            "Kontrol Merkezi",
             self.config["clients"][0].get("name", "Client 1"),
             self.config["clients"][1].get("name", "Client 2"),
             "Telegram & Otomasyon",
             "Loglar",
         ]
-        self.nav_items = []
-        for title in nav_titles:
-            item = QListWidgetItem(title)
-            item.setSizeHint(QSize(180, 56))
-            self.nav_list.addItem(item)
-            self.nav_items.append(item)
-        root_layout.addWidget(self.nav_list)
+        self.nav_buttons = []
+        for index, title in enumerate(nav_titles):
+            button = QPushButton(title)
+            button.setObjectName("NavButton")
+            button.setCheckable(True)
+            button.setAutoExclusive(True)
+            button.clicked.connect(lambda checked, i=index: self._navigate(i))
+            nav_layout.addWidget(button)
+            self.nav_buttons.append(button)
+
+        nav_layout.addStretch()
+        root_layout.addWidget(nav_panel)
+
+        content = QFrame()
+        content.setObjectName("ContentFrame")
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(24)
+
+        hero = QFrame()
+        hero.setObjectName("HeroBanner")
+        hero_layout = QVBoxLayout(hero)
+        hero_layout.setContentsMargins(18, 18, 18, 18)
+        hero_layout.setSpacing(6)
+        hero_title = QLabel("Merlis PM Kontrol Merkezi")
+        hero_title.setObjectName("HeroTitle")
+        hero_desc = QLabel(
+            "dxcam yakalama, Tesseract OCR ve Telegram otomasyonu ile iki Merlis istemcisini tek panelden yönetin."
+        )
+        hero_desc.setObjectName("HeroSubtitle")
+        hero_desc.setWordWrap(True)
+        hero_layout.addWidget(hero_title)
+        hero_layout.addWidget(hero_desc)
+        content_layout.addWidget(hero)
 
         self.stack = QStackedWidget()
-        root_layout.addWidget(self.stack, 1)
+        content_layout.addWidget(self.stack, 1)
+
+        root_layout.addWidget(content, 1)
 
         overview = self._build_overview_page()
         client_pages = [self._build_client_page(0), self._build_client_page(1)]
@@ -785,9 +931,25 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(telegram_page)
         self.stack.addWidget(logs_page)
 
-        self.nav_list.currentRowChanged.connect(self.stack.setCurrentIndex)
-        self.nav_list.setCurrentRow(0)
         self.setCentralWidget(central)
+        self._navigate(0)
+        self._refresh_navigation_titles()
+
+    def _navigate(self, index: int) -> None:
+        if not self.stack:
+            return
+        index = max(0, min(index, self.stack.count() - 1))
+        self.stack.setCurrentIndex(index)
+        for idx, button in enumerate(self.nav_buttons):
+            if button:
+                button.setChecked(idx == index)
+
+    def _refresh_navigation_titles(self) -> None:
+        for idx, state in enumerate(self.client_states[:2]):
+            name = state.config.get("name", f"Client {idx + 1}")
+            button_index = 1 + idx
+            if button_index < len(self.nav_buttons):
+                self.nav_buttons[button_index].setText(name)
 
     def _build_overview_page(self) -> QWidget:
         page = QWidget()
@@ -1288,8 +1450,8 @@ class MainWindow(QMainWindow):
 
     def _update_client_name(self, idx: int) -> None:
         name = self.config["clients"][idx].get("name", f"Client {idx + 1}")
-        if 1 + idx < len(self.nav_items):
-            self.nav_items[1 + idx].setText(name)
+        if 1 + idx < len(self.nav_buttons):
+            self.nav_buttons[1 + idx].setText(name)
         state = self.client_states[idx]
         if state.name_label:
             state.name_label.setText(name)
