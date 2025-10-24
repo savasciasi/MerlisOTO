@@ -5,7 +5,7 @@ import json
 import threading
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 CONFIG_FILE = Path("config.json")
 
@@ -24,21 +24,25 @@ class TelegramSettings:
 
 
 @dataclass
-class RoboflowSettings:
-    api_key: str = "TQD3fN53VSQE0ppFwLkM"
-    workspace: str = "kaan-cqltj"
-    project: str = "merlis-player-5m198"
-    version: int = 3
-    confidence: float = 0.5
-    overlap: float = 0.5
+class OCRSettings:
+    language: str = "tur+eng"
+    oem: int = 3
+    psm: int = 6
+    confidence: float = 0.7
+    min_text_length: int = 3
+    custom_config: str = ""
+    player_keywords: List[str] = field(
+        default_factory=lambda: ["player", "oyuncu", "lv", "guild", "hp"]
+    )
+    pm_keywords: List[str] = field(
+        default_factory=lambda: ["pm", "fısıltı", "whisper", "mesaj"]
+    )
 
 
 @dataclass
 class DetectionSettings:
     monitor_index: int = 0
-    enable_player: bool = True
     enable_pm_box: bool = True
-    enable_pm_send: bool = False
     save_overlay_dir: str = "captures"
     show_only_player: bool = False
 
@@ -46,7 +50,7 @@ class DetectionSettings:
 @dataclass
 class AppState:
     telegram: TelegramSettings = field(default_factory=TelegramSettings)
-    roboflow: RoboflowSettings = field(default_factory=RoboflowSettings)
+    ocr: OCRSettings = field(default_factory=OCRSettings)
     detection: DetectionSettings = field(default_factory=DetectionSettings)
     theme: str = "dark"
 
@@ -74,10 +78,10 @@ class ConfigManager:
 
     def _update_state(self, raw: Dict[str, Any]) -> None:
         telegram = raw.get("telegram", {})
-        roboflow = raw.get("roboflow", {})
+        ocr = raw.get("ocr", {})
         detection = raw.get("detection", {})
         self.state.telegram = TelegramSettings(**{**asdict(TelegramSettings()), **telegram})
-        self.state.roboflow = RoboflowSettings(**{**asdict(RoboflowSettings()), **roboflow})
+        self.state.ocr = OCRSettings(**{**asdict(OCRSettings()), **ocr})
         self.state.detection = DetectionSettings(**{**asdict(DetectionSettings()), **detection})
         self.state.theme = raw.get("theme", "dark")
 

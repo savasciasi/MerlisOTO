@@ -1,4 +1,4 @@
-"""Roboflow detection utilities for the Merlis Metin2 bot."""
+"""Tesseract OCR utilities for the Merlis Metin2 bot."""
 from __future__ import annotations
 
 import time
@@ -9,9 +9,12 @@ import cv2
 import numpy as np
 
 try:
-    from roboflow import Roboflow
-except Exception:  # pragma: no cover - roboflow optional during development
-    Roboflow = None  # type: ignore
+    import pytesseract
+    from pytesseract import Output, TesseractNotFoundError
+except Exception:  # pragma: no cover - pytesseract optional during development
+    pytesseract = None  # type: ignore
+    Output = None  # type: ignore
+    TesseractNotFoundError = RuntimeError  # type: ignore
 
 
 PLAYER_LABEL = "player"
@@ -26,6 +29,7 @@ class Detection:
     y: int
     width: int
     height: int
+    text: str
 
     def to_rect(self) -> tuple[int, int, int, int]:
         half_w = self.width // 2
@@ -37,82 +41,131 @@ class Detection:
         return x1, y1, x2, y2
 
 
-class RoboflowDetector:
-    """Lazy Roboflow model loader and predictor."""
+class TesseractDetector:
+    """Wrapper around pytesseract OCR calls."""
 
     def __init__(
         self,
-        api_key: str,
-        workspace: str,
-        project: str,
-        version: int,
+        language: str,
+        oem: int,
+        psm: int,
+        custom_config: str = "",
     ) -> None:
-        self.api_key = api_key
-        self.workspace = workspace
-        self.project = project
-        self.version = version
-        self._model = None
-        self._last_load_error: Optional[str] = None
+        self.configure(language, oem, psm, custom_config)
 
-    def ensure_model(self) -> None:
-        if self._model is not None:
-            return
-        if Roboflow is None:
-            raise RuntimeError("roboflow paketi yüklenemedi. Lütfen kurulu olduğundan emin olun.")
-        api_key = (self.api_key or "").strip()
-        workspace = (self.workspace or "").strip()
-        project_name = (self.project or "").strip()
-        if not workspace or not project_name:
-            raise RuntimeError(
-                "Roboflow workspace ve proje bilgileri boş olamaz. Lütfen ayarları güncelleyin."
-            )
-        try:
-            rf = Roboflow(api_key=api_key)
-            workspace_ref = rf.workspace(workspace)
-            project = workspace_ref.project(project_name)
-            self._model = project.version(self.version).model
-            self._last_load_error = None
-        except Exception as exc:  # pragma: no cover - depends on external API
-            self._model = None
-            message = str(exc)
-            if "missing permissions" in message or "Unsupported request" in message:
-                friendly = (
-                    "Roboflow kimlik bilgileri doğrulanamadı. API anahtarını ve "
-                    "workspace/proje ayarlarını kontrol edin."
-                )
-            else:
-                friendly = "Roboflow modeli yüklenemedi."
-            self._last_load_error = friendly
-            raise RuntimeError(f"{friendly} (Detay: {message})") from exc
+    def configure(self, language: str, oem: int, psm: int, custom_config: str = "") -> None:
+        self.language = (language or "eng").strip()
+        self.oem = max(0, oem)
+        self.psm = max(0, psm)
+        self.custom_config = custom_config.strip()
 
     def predict(
         self,
         frame: np.ndarray,
         confidence: float,
-        overlap: float,
-        labels: Optional[Sequence[str]] = None,
+        min_text_length: int,
+        player_keywords: Optional[Sequence[str]] = None,
+        pm_keywords: Optional[Sequence[str]] = None,
+        include_pm: bool = True,
     ) -> List[Detection]:
-        self.ensure_model()
-        if self._model is None:
-            return []
-        prediction = self._model.predict(frame, confidence=confidence, overlap=overlap).json()
-        predictions = prediction.get("predictions", [])
+        if pytesseract is None:
+            raise RuntimeError("pytesseract paketi yüklenemedi. Lütfen kurulumunu tamamlayın.")
+        try:
+            config = f"--oem {self.oem} --psm {self.psm}"
+            if self.custom_config:
+                config = f"{config} {self.custom_config}"
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            data = pytesseract.image_to_data(
+                rgb,
+                lang=self.language or "eng",
+                config=config,
+                output_type=Output.DICT,
+            )
+        except TesseractNotFoundError as exc:  # pragma: no cover - depends on system setup
+            raise RuntimeError(
+                "Tesseract yürütülebilir dosyası bulunamadı. Lütfen sisteminize kurun ve PATH içerisine ekleyin."
+            ) from exc
+        except Exception as exc:  # pragma: no cover - passthrough external errors
+            raise RuntimeError(f"OCR çalıştırılamadı: {exc}") from exc
+
+        min_conf = max(0.0, min(confidence, 1.0)) * 100.0
+        min_length = max(1, min_text_length)
+        player_terms = _normalise_terms(player_keywords)
+        pm_terms = _normalise_terms(pm_keywords)
+
         detections: List[Detection] = []
-        for item in predictions:
-            label = item.get("class", "")
-            if labels and label not in labels:
+        texts = data.get("text", [])
+        confs = data.get("conf", [])
+        lefts = data.get("left", [])
+        tops = data.get("top", [])
+        widths = data.get("width", [])
+        heights = data.get("height", [])
+        for i in range(len(texts)):
+            text = (texts[i] or "").strip()
+            if not text:
+                continue
+            try:
+                conf_raw = confs[i]
+            except Exception:
+                conf_raw = "0"
+            try:
+                conf_val = float(conf_raw)
+            except Exception:
+                conf_val = 0.0
+            if conf_val < min_conf:
+                continue
+            if len(text) < min_length:
+                continue
+            try:
+                left = int(lefts[i])
+                top = int(tops[i])
+                width = int(widths[i])
+                height = int(heights[i])
+            except Exception:
+                continue
+            if width <= 0 or height <= 0:
+                continue
+            label = _classify_text(text, player_terms, pm_terms, include_pm)
+            if label is None:
                 continue
             detections.append(
                 Detection(
                     label=label,
-                    confidence=float(item.get("confidence", 0.0)),
-                    x=int(item.get("x", 0)),
-                    y=int(item.get("y", 0)),
-                    width=int(item.get("width", 0)),
-                    height=int(item.get("height", 0)),
+                    confidence=conf_val / 100.0,
+                    x=left + width // 2,
+                    y=top + height // 2,
+                    width=width,
+                    height=height,
+                    text=text,
                 )
             )
         return detections
+
+
+def _normalise_terms(terms: Optional[Sequence[str]]) -> List[str]:
+    if not terms:
+        return []
+    return [term.lower().strip() for term in terms if term and term.strip()]
+
+
+def _classify_text(
+    text: str,
+    player_terms: Sequence[str],
+    pm_terms: Sequence[str],
+    include_pm: bool,
+) -> Optional[str]:
+    lowered = text.lower()
+    if include_pm and pm_terms:
+        for term in pm_terms:
+            if term and term in lowered:
+                return PM_BOX_LABEL
+    if player_terms:
+        for term in player_terms:
+            if term and term in lowered:
+                return PLAYER_LABEL
+        return None
+    # if no player terms provided, treat every text as player (unless PM matched above)
+    return PLAYER_LABEL
 
 
 def draw_detections(frame: np.ndarray, detections: Sequence[Detection]) -> np.ndarray:
@@ -122,15 +175,16 @@ def draw_detections(frame: np.ndarray, detections: Sequence[Detection]) -> np.nd
         x1, y1, x2, y2 = det.to_rect()
         color = (0, 200, 0) if det.label == PLAYER_LABEL else (255, 140, 0)
         cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
-        label = f"{det.label} {det.confidence:.2f}"
-        (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(output, (x1, y1 - th - baseline), (x1 + tw, y1), color, -1)
+        label = f"{det.label} {det.confidence:.2f}: {det.text}"
+        (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        y_text = max(y1 - th - baseline, 0)
+        cv2.rectangle(output, (x1, y_text), (x1 + tw, y_text + th + baseline), color, -1)
         cv2.putText(
             output,
             label,
-            (x1, y1 - baseline),
+            (x1, y_text + th),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
+            0.45,
             (0, 0, 0),
             1,
             cv2.LINE_AA,
@@ -145,7 +199,7 @@ def compute_fps(samples: Sequence[float]) -> float:
 
 
 def crop_with_padding(frame: np.ndarray, detection: Detection, padding: int = 0) -> np.ndarray:
-    x1, y1, x2, y2 = det_rect = detection.to_rect()
+    x1, y1, x2, y2 = detection.to_rect()
     height, width = frame.shape[:2]
     x1 = max(x1 - padding, 0)
     y1 = max(y1 - padding, 0)

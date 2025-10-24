@@ -1,17 +1,17 @@
 # Merlis Metin2 Bot Kontrol Paneli
 
-Modern PyQt5 arayüzü ile Metin2 ekran görüntüsü üzerinden Roboflow YOLOv11 tespiti yapan bu proje, oyuncu (`player`) ve özel mesaj kutusu (`pm-box`) sınıflarını gerçek zamanlı izler. Uygulama, tespit edilen PM kutularını isteğe bağlı olarak Telegram'a iletebilir, ekran görüntülerini kaydedebilir ve test modu ile kayıtlı görüntü/video üzerinde çalışabilir.
+Modern PyQt5 arayüzü ile Metin2 ekran görüntüsü üzerinden Tesseract OCR tespiti yapan bu proje, oyuncu (`player`) ve özel mesaj kutusu (`pm-box`) ifadelerini gerçek zamanlı izlemenizi sağlar. Uygulama, tespit edilen PM kutularını isteğe bağlı olarak Telegram'a iletebilir, ekran görüntülerini kaydedebilir ve test modu ile kayıtlı görüntü/video üzerinde çalışabilir.
 
 ## Özellikler
 
 - PyQt5 tabanlı koyu temalı kontrol paneli
 - MSS ile gerçek zamanlı ekran yakalama
-- Roboflow YOLOv11 modeli ile `player` ve `pm-box` tespiti
+- Tesseract OCR ile anahtar kelime tabanlı `player` ve `pm-box` eşleşmeleri
 - Canlı önizlemede tespit kutuları ve etiketleri
 - FPS, son olay ve zaman damgalı log takibi
-- Son 10 oyuncu tespitinin listelenmesi
-- PM kutusu tespiti, Telegram otomatik gönderimi ve kırpma padding ayarları
-- Model/API ve Telegram bilgilerinin GUI üzerinden değiştirilmesi
+- Son 10 oyuncu eşleşmesinin listelenmesi
+- PM kutusu eşleşmesi, Telegram otomatik gönderimi ve kırpma padding ayarları
+- OCR ve Telegram bilgilerinin GUI üzerinden değiştirilmesi
 - Test modu ile görüntü veya video dosyası üzerinden simülasyon
 - Overlay içeren ekran görüntülerini `captures/` klasörüne kaydetme
 - Ayarların `config.json` dosyasında saklanması
@@ -21,11 +21,11 @@ Modern PyQt5 arayüzü ile Metin2 ekran görüntüsü üzerinden Roboflow YOLOv1
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-> Not: `requirements.txt` dosyasını kendi ortamınıza uygun paket listesiyle oluşturabilirsiniz. Projede kullanılan temel paketler: `PyQt5`, `opencv-python`, `numpy`, `mss`, `roboflow`, `python-telegram-bot==13.15`, `pillow`, `supervision` (opsiyonel).
+> Not: Tesseract OCR motorunun sisteminizde kurulu olması gerekir. Windows için [Tesseract kurulumu](https://github.com/UB-Mannheim/tesseract/wiki) sayfasından indirip PATH değişkenine ekleyebilirsiniz.
 
 ## Kullanım
 
@@ -33,12 +33,12 @@ pip install -r requirements.txt
 python app.py
 ```
 
-İlk açılışta Roboflow ve Telegram ayarlarını girerek kaydedebilirsiniz. Ayarlar uygulama kapandığında `config.json` dosyasına yazılır.
+İlk açılışta OCR ve Telegram ayarlarını girerek kaydedebilirsiniz. Ayarlar uygulama kapandığında `config.json` dosyasına yazılır.
 
 ### Test Modu
 
-- `Model / API` sekmesindeki **Tek Kare Test Et** butonu ile bir görüntü veya video dosyası seçerek tahmini simüle edebilirsiniz.
-- Video seçilmesi durumunda tahminler ayrı bir iş parçacığında oynatılır.
+- `OCR Ayarları` sekmesindeki **Tek Kare OCR Testi** butonu ile bir görüntü veya video dosyası seçerek tespiti simüle edebilirsiniz.
+- Video seçilmesi durumunda OCR işlemleri ayrı bir iş parçacığında oynatılır.
 
 ### Ekran Görüntüsü
 
@@ -51,4 +51,3 @@ pyinstaller --noconsole --name "MerlisMetin2Bot" app.py --add-data "assets;asset
 ```
 
 Oluşturulan `dist/MerlisMetin2Bot.exe` dosyası uygulamayı Windows üzerinde tek başına çalıştırır.
-

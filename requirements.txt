@@ -2,7 +2,6 @@ PyQt5
 opencv-python
 numpy
 mss
-roboflow
+pytesseract
 python-telegram-bot==13.15
 pillow
-supervision

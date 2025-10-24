@@ -41,8 +41,8 @@ from detector import (
     PLAYER_LABEL,
     PM_BOX_LABEL,
     Detection,
-    RoboflowDetector,
     SlidingWindowFPS,
+    TesseractDetector,
     convert_frame_to_qimage,
     crop_with_padding,
     draw_detections,
@@ -66,11 +66,11 @@ class DetectionWorker(QThread):
         self._state = app_state
         self._video_source = video_source
         self._stop_event = threading.Event()
-        self._detector = RoboflowDetector(
-            api_key=app_state.roboflow.api_key,
-            workspace=app_state.roboflow.workspace,
-            project=app_state.roboflow.project,
-            version=app_state.roboflow.version,
+        self._detector = TesseractDetector(
+            language=app_state.ocr.language,
+            oem=app_state.ocr.oem,
+            psm=app_state.ocr.psm,
+            custom_config=app_state.ocr.custom_config,
         )
         self._telegram_client: Optional[TelegramClient] = None
         self._last_event = "Hazır"
@@ -113,14 +113,19 @@ class DetectionWorker(QThread):
 
     def _process_frame(self, frame: np.ndarray) -> None:
         try:
-            labels = [PLAYER_LABEL]
-            if self._state.detection.enable_pm_box:
-                labels.append(PM_BOX_LABEL)
+            self._detector.configure(
+                language=self._state.ocr.language,
+                oem=self._state.ocr.oem,
+                psm=self._state.ocr.psm,
+                custom_config=self._state.ocr.custom_config,
+            )
             detections = self._detector.predict(
                 frame,
-                confidence=self._state.roboflow.confidence,
-                overlap=self._state.roboflow.overlap,
-                labels=labels,
+                confidence=self._state.ocr.confidence,
+                min_text_length=self._state.ocr.min_text_length,
+                player_keywords=self._state.ocr.player_keywords,
+                pm_keywords=self._state.ocr.pm_keywords,
+                include_pm=self._state.detection.enable_pm_box,
             )
         except Exception as exc:
             self._handle_prediction_failure(frame, str(exc))
@@ -134,8 +139,10 @@ class DetectionWorker(QThread):
 
         annotated = draw_detections(frame, filtered)
         if filtered:
-            self._last_event = f"{len(filtered)} tespit bulundu"
+            self._last_event = f"{len(filtered)} OCR eşleşmesi bulundu"
             self.detectionsUpdated.emit(filtered)
+        else:
+            self._last_event = "Eşleşme bulunamadı"
 
         fps = self._fps_counter.update()
         qimage = convert_frame_to_qimage(annotated)
@@ -172,11 +179,11 @@ class DetectionWorker(QThread):
                 break
 
     def _handle_prediction_failure(self, frame: np.ndarray, message: str) -> None:
-        formatted = message if message.startswith("Tahmin") else f"Tahmin yapılamadı: {message}"
+        formatted = message if message.startswith("OCR") else f"OCR yapılamadı: {message}"
         if self._last_detection_error != formatted:
             self.logMessage.emit("ERROR", formatted)
             self._last_detection_error = formatted
-        self._last_event = "Tahmin hatası"
+        self._last_event = "OCR hatası"
         fps = self._fps_counter.update()
         qimage = convert_frame_to_qimage(frame)
         self.frameReady.emit(qimage, [])
@@ -235,7 +242,7 @@ class MainWindow(QMainWindow):
                 "Dashboard",
                 "Oyuncu Tanıma",
                 "PM Mesaj Algılama",
-                "Model / API",
+                "OCR Ayarları",
                 "Telegram",
                 "Loglar",
             ]
@@ -249,7 +256,7 @@ class MainWindow(QMainWindow):
         self._init_dashboard()
         self._init_player_page()
         self._init_pm_page()
-        self._init_model_page()
+        self._init_ocr_page()
         self._init_telegram_page()
         self._init_logs_page()
 
@@ -292,14 +299,14 @@ class MainWindow(QMainWindow):
 
         self.confidence_slider = QSlider(Qt.Horizontal)
         self.confidence_slider.setRange(0, 100)
-        self.confidence_slider.setValue(int(self.config.state.roboflow.confidence * 100))
-        grid.addWidget(QLabel("Güven: %"), 0, 0)
+        self.confidence_slider.setValue(int(self.config.state.ocr.confidence * 100))
+        grid.addWidget(QLabel("Minimum güven: %"), 0, 0)
         grid.addWidget(self.confidence_slider, 0, 1)
 
         self.overlap_slider = QSlider(Qt.Horizontal)
-        self.overlap_slider.setRange(0, 100)
-        self.overlap_slider.setValue(int(self.config.state.roboflow.overlap * 100))
-        grid.addWidget(QLabel("Örtüşme: %"), 1, 0)
+        self.overlap_slider.setRange(1, 20)
+        self.overlap_slider.setValue(int(self.config.state.ocr.min_text_length))
+        grid.addWidget(QLabel("Minimum karakter sayısı"), 1, 0)
         grid.addWidget(self.overlap_slider, 1, 1)
 
         self.only_player_checkbox = QCheckBox("Sadece oyuncu tespitlerini göster")
@@ -350,31 +357,44 @@ class MainWindow(QMainWindow):
 
         self.stack.addWidget(page)
 
-    def _init_model_page(self) -> None:
+    def _init_ocr_page(self) -> None:
         page = QWidget()
         layout = QVBoxLayout(page)
 
-        self.api_key_edit = QLineEdit(self.config.state.roboflow.api_key)
-        self.api_key_edit.setEchoMode(QLineEdit.Password)
-        self.workspace_edit = QLineEdit(self.config.state.roboflow.workspace)
-        self.project_edit = QLineEdit(self.config.state.roboflow.project)
-        self.version_spin = QSpinBox()
-        self.version_spin.setRange(1, 99)
-        self.version_spin.setValue(self.config.state.roboflow.version)
-
         form = QGridLayout()
-        form.addWidget(QLabel("API Anahtarı"), 0, 0)
-        form.addWidget(self.api_key_edit, 0, 1)
-        form.addWidget(QLabel("Çalışma Alanı"), 1, 0)
-        form.addWidget(self.workspace_edit, 1, 1)
-        form.addWidget(QLabel("Proje"), 2, 0)
-        form.addWidget(self.project_edit, 2, 1)
-        form.addWidget(QLabel("Versiyon"), 3, 0)
-        form.addWidget(self.version_spin, 3, 1)
+
+        self.language_edit = QLineEdit(self.config.state.ocr.language)
+        form.addWidget(QLabel("Dil (lang)"), 0, 0)
+        form.addWidget(self.language_edit, 0, 1)
+
+        self.oem_spin = QSpinBox()
+        self.oem_spin.setRange(0, 3)
+        self.oem_spin.setValue(self.config.state.ocr.oem)
+        form.addWidget(QLabel("OEM"), 1, 0)
+        form.addWidget(self.oem_spin, 1, 1)
+
+        self.psm_spin = QSpinBox()
+        self.psm_spin.setRange(0, 13)
+        self.psm_spin.setValue(self.config.state.ocr.psm)
+        form.addWidget(QLabel("PSM"), 2, 0)
+        form.addWidget(self.psm_spin, 2, 1)
+
+        self.custom_config_edit = QLineEdit(self.config.state.ocr.custom_config)
+        form.addWidget(QLabel("Ek OCR Parametreleri"), 3, 0)
+        form.addWidget(self.custom_config_edit, 3, 1)
+
+        self.player_keywords_edit = QLineEdit(", ".join(self.config.state.ocr.player_keywords))
+        form.addWidget(QLabel("Oyuncu anahtar kelimeleri"), 4, 0)
+        form.addWidget(self.player_keywords_edit, 4, 1)
+
+        self.pm_keywords_edit = QLineEdit(", ".join(self.config.state.ocr.pm_keywords))
+        form.addWidget(QLabel("PM anahtar kelimeleri"), 5, 0)
+        form.addWidget(self.pm_keywords_edit, 5, 1)
+
         layout.addLayout(form)
 
-        self.test_model_button = QPushButton("Tek Kare Test Et")
-        layout.addWidget(self.test_model_button)
+        self.test_ocr_button = QPushButton("Tek Kare OCR Testi")
+        layout.addWidget(self.test_ocr_button)
 
         self.stack.addWidget(page)
 
@@ -469,14 +489,16 @@ class MainWindow(QMainWindow):
         self.pm_detection_checkbox.toggled.connect(self._update_pm_detection)
         self.pm_auto_send_checkbox.toggled.connect(self._update_pm_auto_send)
         self.padding_spin.valueChanged.connect(self._update_padding)
-        self.api_key_edit.textChanged.connect(self._update_model_settings)
-        self.workspace_edit.textChanged.connect(self._update_model_settings)
-        self.project_edit.textChanged.connect(self._update_model_settings)
-        self.version_spin.valueChanged.connect(self._update_model_settings)
+        self.language_edit.textChanged.connect(self._update_ocr_settings)
+        self.oem_spin.valueChanged.connect(self._update_ocr_settings)
+        self.psm_spin.valueChanged.connect(self._update_ocr_settings)
+        self.custom_config_edit.textChanged.connect(self._update_ocr_settings)
+        self.player_keywords_edit.textChanged.connect(self._update_ocr_settings)
+        self.pm_keywords_edit.textChanged.connect(self._update_ocr_settings)
         self.bot_token_edit.textChanged.connect(self._update_telegram_settings)
         self.chat_id_edit.textChanged.connect(self._update_telegram_settings)
         self.test_message_button.clicked.connect(self._send_test_message)
-        self.test_model_button.clicked.connect(self._run_single_frame_test)
+        self.test_ocr_button.clicked.connect(self._run_single_frame_test)
         self.clear_logs_button.clicked.connect(lambda: self.log_text.clear())
 
         # Shortcuts
@@ -543,7 +565,10 @@ class MainWindow(QMainWindow):
         for det in detections:
             if det.label != PLAYER_LABEL:
                 continue
-            entry = f"{datetime.now().strftime('%H:%M:%S')} - Güven {det.confidence:.2f}"
+            entry = (
+                f"{datetime.now().strftime('%H:%M:%S')} - {det.text} "
+                f"({det.confidence * 100:.0f}%)"
+            )
             self.player_detections.append(entry)
         self.player_detections = self.player_detections[-10:]
         self.last_detections_list.clear()
@@ -562,11 +587,11 @@ class MainWindow(QMainWindow):
                 label.clear()
 
     def _update_confidence(self, value: int) -> None:
-        self.config.state.roboflow.confidence = value / 100
+        self.config.state.ocr.confidence = value / 100
         self.config.save()
 
     def _update_overlap(self, value: int) -> None:
-        self.config.state.roboflow.overlap = value / 100
+        self.config.state.ocr.min_text_length = value
         self.config.save()
 
     def _update_show_only_player(self, checked: bool) -> None:
@@ -585,17 +610,23 @@ class MainWindow(QMainWindow):
         self.config.state.telegram.padding = value
         self.config.save()
 
-    def _update_model_settings(self) -> None:
-        self.config.state.roboflow.api_key = self.api_key_edit.text()
-        self.config.state.roboflow.workspace = self.workspace_edit.text()
-        self.config.state.roboflow.project = self.project_edit.text()
-        self.config.state.roboflow.version = self.version_spin.value()
+    def _update_ocr_settings(self) -> None:
+        self.config.state.ocr.language = self.language_edit.text()
+        self.config.state.ocr.oem = self.oem_spin.value()
+        self.config.state.ocr.psm = self.psm_spin.value()
+        self.config.state.ocr.custom_config = self.custom_config_edit.text()
+        self.config.state.ocr.player_keywords = self._parse_keywords(self.player_keywords_edit.text())
+        self.config.state.ocr.pm_keywords = self._parse_keywords(self.pm_keywords_edit.text())
         self.config.save()
 
     def _update_telegram_settings(self) -> None:
         self.config.state.telegram.bot_token = self.bot_token_edit.text()
         self.config.state.telegram.chat_id = self.chat_id_edit.text()
         self.config.save()
+
+    @staticmethod
+    def _parse_keywords(text: str) -> List[str]:
+        return [part.strip() for part in text.split(",") if part.strip()]
 
     def save_capture(self) -> None:
         pixmap = self.preview_label.pixmap()
@@ -641,26 +672,34 @@ class MainWindow(QMainWindow):
             self._run_test_video(file_path)
 
     def _predict_single_frame(self, frame: np.ndarray) -> None:
-        detector = RoboflowDetector(
-            self.config.state.roboflow.api_key,
-            self.config.state.roboflow.workspace,
-            self.config.state.roboflow.project,
-            self.config.state.roboflow.version,
+        detector = TesseractDetector(
+            language=self.config.state.ocr.language,
+            oem=self.config.state.ocr.oem,
+            psm=self.config.state.ocr.psm,
+            custom_config=self.config.state.ocr.custom_config,
         )
         try:
             detections = detector.predict(
                 frame,
-                confidence=self.config.state.roboflow.confidence,
-                overlap=self.config.state.roboflow.overlap,
-                labels=[PLAYER_LABEL, PM_BOX_LABEL],
+                confidence=self.config.state.ocr.confidence,
+                min_text_length=self.config.state.ocr.min_text_length,
+                player_keywords=self.config.state.ocr.player_keywords,
+                pm_keywords=self.config.state.ocr.pm_keywords,
+                include_pm=self.config.state.detection.enable_pm_box,
             )
         except Exception as exc:
-            self.log_panel.append("ERROR", f"Test tahmini başarısız: {exc}")
+            self.log_panel.append("ERROR", f"Test OCR işlemi başarısız: {exc}")
             return
         annotated = draw_detections(frame, detections)
         qimage = convert_frame_to_qimage(annotated)
-        self.preview_label.setPixmap(QPixmap.fromImage(qimage).scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        self.log_panel.append("INFO", f"Test tahmini tamamlandı. {len(detections)} tespit bulundu.")
+        self.preview_label.setPixmap(
+            QPixmap.fromImage(qimage).scaled(
+                self.preview_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        )
+        self.log_panel.append("INFO", f"Test OCR tamamlandı. {len(detections)} eşleşme bulundu.")
 
     def _run_test_video(self, file_path: str) -> None:
         if self.worker and self.worker.isRunning():
