@@ -1,0 +1,19 @@
+{
+  "api_key": "TQD3fN53VSQE0ppFwLkM",
+  "workspace": "kaan-cqltj",
+  "project": "merlis-player-5ml98",
+  "version": 2,
+  "confidence": 45,
+  "overlap": 55,
+  "monitor_index": 0,
+  "roi_top": 0,
+  "roi_left": 0,
+  "roi_width": 0,
+  "roi_height": 0,
+  "lock_pid": 9448,
+  "process_hint": "merlis",
+  "auto_send_pm": true,
+  "crop_padding": 8,
+  "telegram_token": "7876998866:AAGZr0YjgvOowyKmMO6Sm55mH9pnEPbueBk",
+  "telegram_chat_id": "6961279850"
+}

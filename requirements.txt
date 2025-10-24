@@ -1,0 +1,10 @@
+PyQt5
+opencv-python
+numpy
+mss
+roboflow
+Pillow
+requests
+pywin32
+psutil
+dxcam
