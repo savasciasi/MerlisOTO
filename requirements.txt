@@ -1,0 +1,10 @@
+PyQt5
+opencv-python
+numpy
+dxcam
+mss
+requests
+pywin32
+psutil
+Pillow
+pytesseract
